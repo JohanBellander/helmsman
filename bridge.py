@@ -468,15 +468,10 @@ async def beszel_webhook(
     message = payload.get("message") or payload.get("body") or payload.get("raw") or ""
     log.info("beszel webhook: title=%r len(message)=%d", title, len(str(message)))
 
-    synthetic_user = "A Beszel alert just came in.\n"
+    synthetic_user = "Beszel webhook alert.\n"
     if title:
         synthetic_user += f"Title: {title}\n"
-    synthetic_user += (
-        f"Message: {message}\n\n"
-        "Investigate using available tools and tell me about it. "
-        "Make clear in your reply that this came from a Beszel alert — "
-        "I'm reading this on Telegram with no other context."
-    )
+    synthetic_user += f"Message: {message}\n\nWhat's goin' on?"
 
     try:
         reply, _ = await run_agent(
