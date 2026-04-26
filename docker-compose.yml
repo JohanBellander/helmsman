@@ -14,7 +14,9 @@ services:
       - BESZEL_WEBHOOK_SECRET=${BESZEL_WEBHOOK_SECRET}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     networks:
-      - coolify
+      coolify:
+        aliases:
+          - helmsman
     expose:
       - "8000"
 
