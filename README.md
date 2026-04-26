@@ -1,237 +1,192 @@
-# Helmsman
+<div align="center">
 
-A self-hosted Telegram bot that lets you chat with your Coolify + Beszel
-homelab cluster through Claude Haiku 4.5. Watches the bridge while you
-sleep: when Beszel fires an alert, Helmsman investigates with read-only
-MCP tools and summarizes what's happening on Telegram.
+# ⚓ Helmsman
 
-Read-only for v1. Single Docker container deployed in Coolify.
+**A self-hosted Telegram ops bot for a Coolify + Beszel homelab.**
+Watches the bridge while you sleep, investigates alerts, and answers questions about the fleet — through Claude Haiku 4.5.
 
-## Architecture
+![Python](https://img.shields.io/badge/python-3.12+-3776ab?logo=python&logoColor=white)
+![Claude](https://img.shields.io/badge/Claude-Haiku%204.5-d97757)
+![MCP](https://img.shields.io/badge/MCP-Beszel%20%2B%20Coolify-2563eb)
+![Deploy](https://img.shields.io/badge/deploy-Coolify-7c3aed)
+![Access](https://img.shields.io/badge/access-read--only-22c55e)
 
-```
-            +------------------+
-   you <--->| Telegram (poll)  |
-            +--------+---------+
-                     |
-                     v
-  +--------------------------------------+        +-------------+
-  |  bridge.py  (Python, single asyncio  |<------>|  Anthropic  |
-  |             event loop)              |        | (Haiku 4.5) |
-  |                                      |        +-------------+
-  |  +-- stdio --> beszel-mcp (Python)   |
-  |  +-- stdio --> @masonator/coolify-mcp|
-  |                                      |
-  |  POST /webhook/beszel  <-- Beszel    |
-  +--------------------------------------+
-```
+</div>
 
-One Python process. Two MCP servers as long-lived stdio subprocesses.
-Telegram polling and the FastAPI webhook share the loop via
-`asyncio.TaskGroup`.
+---
 
-Read-only enforcement is done by **filtering the tool list** before passing
-it to Claude. Any MCP tool whose name contains
-`create / update / delete / deploy / start / stop / restart / kill / remove
-/ redeploy / set_env / write` is dropped at startup. Dropped tool names are
-logged so you can see what got filtered. The model literally has no write
-tool to call.
+> **You:** prod-1 cpu is at 95%
+>
+> **Helmsman:** Yo, `prod-1`'s sweatin'. `medianalyzer`'s wildin' — 80% of the cycles, deadass. Tick's been goin' off every 200ms since 14:30. Either somebody messed with her or upstream's dumpin' on her. Want the logs, or just wanna know who?
 
-## Prerequisites
+---
 
-- A Coolify instance you control (the bot deploys there)
-- A Beszel instance reachable on the same Docker network as the bot
-  (typically the `coolify` network)
-- A Telegram account
-- An Anthropic API key with Haiku 4.5 access
+## How it works
 
-## One-time setup
-
-### 1. Telegram credentials
-
-1. Talk to **@BotFather**: `/newbot`, give it a name and username.
-   Save the token it gives you (`TELEGRAM_BOT_TOKEN`).
-2. Talk to **@userinfobot** (or **@RawDataBot**): it replies with your
-   numeric user ID. Save it (`TELEGRAM_ALLOWED_USER_ID`).
-
-The bot will silently ignore every message from any other user ID. It
-does *not* reply with "unauthorized" — silence is the policy.
-
-### 2. Anthropic API key
-
-`https://console.anthropic.com/` → API Keys → Create Key. Save it
-(`ANTHROPIC_API_KEY`).
-
-### 3. Coolify access token
-
-In Coolify: top-right user menu → **Keys & Tokens** → **API Tokens** →
-**Create New Token**. Read scope is enough for v1. Save it
-(`COOLIFY_ACCESS_TOKEN`).
-
-For `COOLIFY_BASE_URL`, since the bot runs on the `coolify` Docker
-network, the internal hostname works:
-
-```
-COOLIFY_BASE_URL=http://coolify:8000
+```mermaid
+flowchart LR
+    You([📱 You]) <-->|Telegram poll| Bridge[bridge.py]
+    Bridge <-->|Messages API| Claude[(Claude Haiku 4.5)]
+    Bridge <-->|stdio| BMCP[beszel-mcp]
+    Bridge <-->|stdio| CMCP[coolify-mcp]
+    BMCP <-->|HTTP| Beszel[(Beszel)]
+    CMCP <-->|HTTP| Coolify[(Coolify)]
+    Beszel -.alerts.-> Bridge
 ```
 
-(If your Coolify service container is named differently, use that name.
-You can check with `docker network inspect coolify`.)
+One Python process, one async event loop. Two MCP servers run as long-lived stdio subprocesses. Telegram polling and the FastAPI webhook server share the loop via `asyncio.TaskGroup`.
 
-### 4. Beszel admin user
+**Read-only by design.** Every MCP tool whose name contains `create / update / delete / deploy / start / stop / restart / kill / remove / redeploy / set_env / write` is dropped at startup *before* tools are exposed to Claude. The dropped names are logged so you can see what got filtered. The model has no write tool to call.
 
-Beszel UI → **Users** → make sure you have a superuser account. The
-beszel-mcp uses email/password admin auth for most tool calls.
+---
 
+## Quick deploy
+
+1. Push (or fork) this repo to GitHub.
+2. In Coolify: **+ New** → **Resource** → **Application** → **Public Repository** → paste the repo URL → branch `main` → build pack `Docker Compose`.
+3. Paste in the env vars (see [Setup](#setup)).
+4. Deploy. Watch logs for `helmsman: N tools registered, M dropped`.
+5. In Beszel UI, add a Shoutrrr URL pointing at `helmsman:8000/webhook/beszel`.
+
+Telegram `/start` should reply. Ask *"what apps are deployed?"* and watch it call out to Coolify.
+
+---
+
+## Setup
+
+### Credentials
+
+| Var | What it is | Where to get it |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot auth token | [@BotFather](https://t.me/BotFather) → `/newbot` |
+| `TELEGRAM_ALLOWED_USER_ID` | Your numeric Telegram ID | [@userinfobot](https://t.me/userinfobot) — copy the `Id` field |
+| `ANTHROPIC_API_KEY` | Claude API key | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| `COOLIFY_ACCESS_TOKEN` | Coolify API token (read scope is enough) | Coolify → user menu → **Keys & Tokens** → **API Tokens** |
+| `BESZEL_EMAIL` / `BESZEL_PASSWORD` | Beszel **superuser** account | Beszel → **Users** |
+| `BESZEL_WEBHOOK_SECRET` | Shared secret for the webhook | `openssl rand -hex 32` |
+
+### Network hostnames
+
+Defaults assume conventional Docker service names. Verify against your actual cluster:
+
+```bash
+docker network inspect coolify --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
 ```
-BESZEL_URL=http://beszel:8090
-BESZEL_EMAIL=admin@example.com
-BESZEL_PASSWORD=...
-```
 
-### 5. Webhook secret
+- `COOLIFY_BASE_URL` is typically `http://coolify:8080` — Coolify v4 listens on **port 8080** internally (not 8000, despite the `EXPOSE` in the upstream image).
+- `BESZEL_URL` for a Coolify-managed Beszel is the hashed container name, e.g. `http://beszel-vuxoeyr2t9d5pcm84xu0o9pk:8090`.
 
-```
-openssl rand -hex 32
-```
+### Beszel Shoutrrr webhook
 
-Save it as `BESZEL_WEBHOOK_SECRET`.
-
-## Deploy in Coolify
-
-1. **Push this repo to GitHub** (private is fine).
-2. In Coolify: **+ New** → **Resource** → **Application** →
-   **Public Repository** if you've made it public, or **Private
-   Repository (with GitHub App)** otherwise. If you don't have a
-   GitHub App configured yet, Coolify will walk you through installing
-   one — let it.
-3. Pick the repo, branch `main`, **Build Pack: Docker Compose**.
-4. **Environment Variables**: paste the values for every key in
-   `.env.example`. Critical: use `COOLIFY_ACCESS_TOKEN` (not
-   `COOLIFY_API_TOKEN` — that's what the upstream MCP actually reads).
-5. Coolify will auto-detect `docker-compose.yml`. Confirm the network
-   is `coolify` (external) — that's how the container reaches `coolify`,
-   `beszel`, and is reachable as `helmsman` from Beszel.
-6. **Disable auto-deploy** under General if you prefer manual deploys.
-7. Click **Deploy**. Watch the logs. You should see something like:
-
-   ```
-   helmsman: spawning MCP beszel: beszel-mcp
-   helmsman: spawning MCP coolify: npx @masonator/coolify-mcp@latest
-   helmsman: 14 tools registered, 6 dropped
-   helmsman: dropped (write) tools: coolify__deploy_application, coolify__restart_application, ...
-   helmsman: telegram polling up
-   ```
-
-## Configure Beszel to call the webhook
-
-In Beszel: **Settings** → **Notifications** → add a Shoutrrr URL:
+In Beszel UI → **Settings** → **Notifications** → add:
 
 ```
 generic://helmsman:8000/webhook/beszel?@authorization=Bearer+<BESZEL_WEBHOOK_SECRET>
 ```
 
-Notes:
-- `helmsman` is the Docker service name (resolves on the `coolify`
-  network).
-- `+` after `Bearer` is the Shoutrrr-encoded space.
-- The bot rejects any request whose `Authorization` header doesn't
-  exactly match `Bearer <secret>` with a 401.
+The `+` after `Bearer` is Shoutrrr's encoded space. The `helmsman` hostname resolves because the bridge registers it as a network alias on the `coolify` network. Wrong/missing header → 401.
 
-If your secret has any character that needs URL-encoding, encode it.
-Hex secrets generated by `openssl rand -hex 32` don't.
+---
 
-## Smoke test
+## Telegram commands
 
-1. Telegram → your bot → `/start`. You should get
-   `"Helmsman at the wheel. N read-only tools loaded ..."`.
-2. Ask: `what servers do I have?` — Helmsman calls Beszel and lists them.
-3. Ask: `what apps are deployed?` — same for Coolify.
-4. Ask: `restart medianalyzer` — should refuse, because the restart
-   tool isn't in its tool list.
-5. From any host on the `coolify` network:
+| Command | What it does |
+|---|---|
+| `/start` | Sanity check, replies with tool count |
+| `/health` | Uptime + liveness probe on each MCP subprocess |
+| `/reset` | Clear conversation history for this chat |
 
-   ```bash
-   curl -X POST http://helmsman:8000/webhook/beszel \
-        -H "Authorization: Bearer $BESZEL_WEBHOOK_SECRET" \
-        -H "Content-Type: application/json" \
-        -d '{"title":"High CPU","message":"prod-1 CPU at 95%"}'
-   ```
+Anything else you type goes to the agent loop. Helmsman picks tools as it needs them and replies in voice.
 
-   Should return `{"ok": true}` and you should get a Telegram message
-   shortly afterward with an investigation summary.
+---
 
-## Commands
+## When stuff breaks
 
-- `/start` — sanity-check + tool count
-- `/reset` — clear the conversation history for this chat
+<details>
+<summary><b>Bot doesn't reply at all</b></summary>
 
-## Troubleshooting
+The allowlist is intentionally silent for any user ID that isn't yours — there's no "unauthorized" reply. Confirm `TELEGRAM_ALLOWED_USER_ID` matches the numeric ID from [@userinfobot](https://t.me/userinfobot) for *your* account.
 
-**Bot doesn't reply at all.** First, confirm `TELEGRAM_ALLOWED_USER_ID`
-matches the numeric ID `@userinfobot` shows for *your* account. The
-filter is intentionally silent for the wrong ID — there is no "unauthorized"
-reply.
+</details>
 
-**Container crashes at startup with `FATAL: missing env vars: ...`.** A
-required environment variable wasn't set in Coolify. Check `.env.example`
-for the full list.
+<details>
+<summary><b>Container crashes at startup with <code>FATAL: missing env vars</code></b></summary>
 
-**`spawning MCP coolify` then errors.** Run `docker logs helmsman` and
-look for stderr from `npx`. Common causes:
-- `COOLIFY_BASE_URL` is wrong or unreachable from inside the container
-- `COOLIFY_ACCESS_TOKEN` is invalid or revoked
-- The `coolify` Docker network isn't actually external in your setup —
-  check `docker network ls`.
+A required environment variable isn't set in Coolify. See [`.env.example`](./.env.example) for the full list.
 
-**`spawning MCP beszel` errors.** Same drill: stderr from `beszel-mcp`.
-Common causes:
-- `BESZEL_URL` not reachable
-- email/password aren't a Beszel **superuser** (regular users can't read
-  most things)
+</details>
 
-**Webhook returns 401.** The `Authorization` header didn't match.
-Triple-check the Shoutrrr URL. The Bearer token is everything after
-`Bearer ` exactly — no quotes, no extra spaces.
+<details>
+<summary><b>MCP fails to spawn</b></summary>
 
-**Tool calls succeed but Claude's reply is "I don't have access to that
-tool".** Check the startup log line listing dropped tools — your read
-tool may have been filtered because its name contains a forbidden token
-(e.g., a Coolify "list-deployments" tool would be dropped because of
-"deploy"). If that happens, file an issue or relax the filter for known
-read-only patterns.
+`docker logs helmsman` and look for stderr from `npx` or `beszel-mcp`. Common causes:
 
-**The container restarts in a loop.** `docker logs --tail 100 helmsman`.
-You're probably hitting a config issue. The agent loop itself catches
-all tool errors and feeds them back to Claude, so it shouldn't crash
-the process.
+- `COOLIFY_BASE_URL` wrong — Coolify v4 listens on **port 8080** internally, not 8000
+- `COOLIFY_ACCESS_TOKEN` invalid or revoked
+- `BESZEL_URL` not reachable on the `coolify` network — use the actual container name from `docker network inspect coolify`
+- Beszel email/password aren't a **superuser**
 
-**Conversations forget context after a restart.** Expected — v1 keeps
-history in-memory only. `/reset` exists if you want to clear it
-manually. Persistent memory is on the v2 list.
+</details>
 
-## What's not in v1
+<details>
+<summary><b>Telegram says <code>InvalidToken</code> / <code>Unauthorized</code></b></summary>
 
-- Write actions (start/stop/restart/deploy). v2 will gate these behind a
-  confirmation code.
-- Direct Docker control (Homebutler-style). Skipping until I have a
-  use case the MCPs can't cover.
-- Persistent conversation memory across restarts.
-- Multi-user / team mode.
-- Slack / Discord output.
-- Cron-scheduled proactive checks (Beszel webhooks cover the proactive
-  case for now).
-- Web UI. Chat is the interface.
+Token rejected by Telegram. Either it's wrong (extra quotes/whitespace from Coolify env paste), revoked, or the bot was deleted. In [@BotFather](https://t.me/BotFather), `/mybots` → pick the bot → **API Token** → **Revoke current token** to get a fresh one.
+
+</details>
+
+<details>
+<summary><b>Webhook returns 401</b></summary>
+
+The `Authorization` header didn't match. The Bearer token after `Bearer ` must equal `BESZEL_WEBHOOK_SECRET` exactly — no quotes, no trailing whitespace, no encoding tricks.
+
+</details>
+
+<details>
+<summary><b>Coolify shows "Running (unknown)" health</b></summary>
+
+The healthcheck is defined in `docker-compose.yml`. After a redeploy from `main`, expect `Starting` for ~30s, then `Healthy`. If it sticks on `Unhealthy`, run the healthcheck manually:
+
+```bash
+docker exec $(docker ps --filter name=helmsman --format '{{.Names}}' | head -1) curl -v http://localhost:8000/health
+```
+
+A 503 with an MCP listed as `error: <Class>` tells you which subprocess is in trouble.
+
+</details>
+
+---
+
+## What's not here yet
+
+- Write actions, gated behind confirmation codes (v2)
+- Persistent conversation memory across restarts (currently in-memory)
+- Multiple users / team mode (single-user allowlist for now)
+- Slack / Discord output (Telegram only)
+- Dashboard / web UI (chat is the interface)
+- Smarter read-only filter — the current denylist drops some legitimate read tools like `list_deployments` because they contain "deploy". v2 will switch to an explicit *allowlist* of read verbs.
+
+---
 
 ## Files
 
-- `bridge.py` — the entire service, async, single file.
-- `system_prompt.md` — Claude's role and style. Edit and redeploy to
-  retune voice without touching code.
-- `Dockerfile` — `python:3.12-slim` + Node 20 (NodeSource).
-- `docker-compose.yml` — the Coolify deployment unit. Single service
-  on the external `coolify` network, port 8000 *exposed* (internal),
-  not *published* (no host port).
-- `requirements.txt`, `package.json` — pinned deps, including the
-  upstream MCPs.
-- `.env.example` — every env var the bridge needs.
+```
+.
+├── bridge.py            # the whole service, async, ~470 lines
+├── system_prompt.md     # Helmsman's voice and operational rules
+├── Dockerfile           # python:3.12-slim + Node 20 (NodeSource)
+├── docker-compose.yml   # Coolify deploy unit, with healthcheck
+├── requirements.txt     # pinned Python deps
+├── package.json         # @masonator/coolify-mcp
+├── .env.example         # every env var the bridge needs
+└── PLAN.md              # original build spec
+```
+
+---
+
+<div align="center">
+
+> *"You can peep, you can't touch."*
+> — Helmsman, on his read-only constraint
+
+</div>
