@@ -21,6 +21,7 @@ import uvicorn
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from telegram import Update
@@ -416,15 +417,17 @@ api = FastAPI(title="Helmsman")
 
 
 @api.get("/health")
-async def health() -> dict[str, Any]:
+async def health() -> JSONResponse:
     mcps = await _mcp_probe()
-    return {
-        "ok": bool(mcps) and all(v == "ok" for v in mcps.values()),
+    ok = bool(mcps) and all(v == "ok" for v in mcps.values())
+    body = {
+        "ok": ok,
         "tools": len(REGISTRY.anthropic_tools),
         "dropped": len(REGISTRY.dropped),
         "mcps": mcps,
         "uptime_seconds": int(time.monotonic() - START_TIME) if START_TIME else 0,
     }
+    return JSONResponse(content=body, status_code=200 if ok else 503)
 
 
 @api.post("/webhook/beszel")
