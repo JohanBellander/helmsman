@@ -105,7 +105,7 @@ LOG_SCAN_LINES = int(os.environ.get("LOG_SCAN_LINES", "200"))
 LOG_SCAN_COOLDOWN_SEC = int(os.environ.get("LOG_SCAN_COOLDOWN_SEC", "1800"))
 
 # Conservative — patterns that almost always indicate a real problem.
-# Bias toward false negatives (per Johan's preference).
+# Bias toward false negatives (tunable via env if you want it noisier).
 LOG_PATTERNS: dict[str, "re.Pattern[str]"] = {
     "oom":        re.compile(r"OOMKilled|out of memory|OutOfMemoryError|MemoryError", re.IGNORECASE),
     "panic":      re.compile(r"\bpanic:|goroutine \d+ \[running\]:", re.IGNORECASE),
