@@ -24,12 +24,17 @@ Watches the bridge while you sleep, investigates alerts, and answers questions a
 ## How it works
 
 ```
-  Telegram  ◄─ polling ─►   bridge.py   ◄─ Messages API ─►  Claude Haiku 4.5
-   (you)                        │
-                                ├─ stdio ─►  beszel-mcp   ─ HTTP ─►  Beszel
-                                ├─ stdio ─►  coolify-mcp  ─ HTTP ─►  Coolify
-                                │
-                                └─◄─ POST /webhook/beszel ─── Beszel alerts
+  ── user ────────────────────────────────────────────────
+   📱 Telegram (long-poll, single-user allowlist)
+  ── process ─────────────────────────────────────────────
+   bridge.py · single asyncio event loop
+   ├ telegram.ext.Application (handlers)
+   ├ FastAPI on :8000  ◄── POST /webhook/beszel
+   ├ AsyncAnthropic  ──────► Claude Haiku 4.5
+   └ AsyncExitStack { beszel-mcp, coolify-mcp }
+  ── cluster ─────────────────────────────────────────────
+   Beszel (HTTP)        ·        Coolify API (HTTP)
+  ────────────────────────────────────────────────────────
 ```
 
 One Python process, one async event loop. Two MCP servers run as long-lived stdio subprocesses. Telegram polling and the FastAPI webhook server share the loop via `asyncio.TaskGroup`.
