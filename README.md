@@ -17,7 +17,7 @@ Watches the bridge while you sleep, investigates alerts, and answers questions a
 
 > **You:** prod-1 cpu is at 95%
 >
-> **Helmsman:** Yo, `prod-1`'s sweatin'. `medianalyzer`'s wildin' — 80% of the cycles, deadass. Tick's been goin' off every 200ms since 14:30. Either somebody messed with her or upstream's dumpin' on her. Want the logs, or just wanna know who?
+> **Helmsman:** Yo, prod-1's sweatin'. MediAnalyzer's wildin' — 80% of the cycles, deadass. Tick's been goin' off every 200ms since 14:30. Either somebody messed with her or upstream's dumpin' on her. Want the logs, or just wanna know who?
 
 ---
 
