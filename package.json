@@ -1,0 +1,9 @@
+{
+  "name": "helmsman-deps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "npm deps for the Helmsman bridge — only @masonator/coolify-mcp",
+  "dependencies": {
+    "@masonator/coolify-mcp": "latest"
+  }
+}

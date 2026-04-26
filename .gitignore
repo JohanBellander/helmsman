@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+package-lock.json
+.venv/
+venv/
+.idea/
+.vscode/
+*.log

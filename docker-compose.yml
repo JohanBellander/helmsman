@@ -1,0 +1,23 @@
+services:
+  helmsman:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - COOLIFY_BASE_URL=${COOLIFY_BASE_URL}
+      - COOLIFY_ACCESS_TOKEN=${COOLIFY_ACCESS_TOKEN}
+      - BESZEL_URL=${BESZEL_URL}
+      - BESZEL_EMAIL=${BESZEL_EMAIL}
+      - BESZEL_PASSWORD=${BESZEL_PASSWORD}
+      - BESZEL_WEBHOOK_SECRET=${BESZEL_WEBHOOK_SECRET}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    networks:
+      - coolify
+    expose:
+      - "8000"
+
+networks:
+  coolify:
+    external: true
