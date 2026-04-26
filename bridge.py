@@ -464,16 +464,18 @@ async def beszel_webhook(
         body = (await request.body()).decode("utf-8", errors="replace")
         payload = {"raw": body}
 
-    title = payload.get("title") or payload.get("subject") or "(no title)"
+    title = payload.get("title") or payload.get("subject")
     message = payload.get("message") or payload.get("body") or payload.get("raw") or ""
     log.info("beszel webhook: title=%r len(message)=%d", title, len(str(message)))
 
-    synthetic_user = (
-        "Beszel alert received.\n"
-        f"Title: {title}\n"
+    synthetic_user = "A Beszel alert just came in.\n"
+    if title:
+        synthetic_user += f"Title: {title}\n"
+    synthetic_user += (
         f"Message: {message}\n\n"
-        "Investigate using available tools and summarize what's happening, "
-        "why, and what I should consider doing."
+        "Investigate using available tools and tell me about it. "
+        "Make clear in your reply that this came from a Beszel alert — "
+        "I'm reading this on Telegram with no other context."
     )
 
     try:
@@ -485,11 +487,14 @@ async def beszel_webhook(
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("webhook agent crashed")
-        reply = f"Beszel alert: {title}\n(bridge error investigating: {exc!s})"
+        reply = (
+            "A Beszel alert came in but I couldn't investigate it. "
+            f"Error: {exc!s}"
+        )
 
     # Push to Telegram. We send to the allowed user's chat — for a single private
     # chat with the bot, chat_id == user_id.
-    for chunk in _split_for_telegram(f"⚓ Beszel: {title}\n\n{reply}"):
+    for chunk in _split_for_telegram(reply):
         try:
             await TG_APP.bot.send_message(chat_id=ALLOWED_USER_ID, text=chunk)
         except Exception:
