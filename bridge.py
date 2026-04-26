@@ -348,17 +348,34 @@ async def on_health(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uptime_str = f"{h}h {m}m" if h else f"{m}m {s}s"
 
     statuses = await _mcp_probe()
-    mcp_line = " | ".join(f"{k}: {v}" for k, v in statuses.items()) or "(none)"
-    all_ok = bool(statuses) and all(v == "ok" for v in statuses.values())
-    headline = "still standin'" if all_ok else "limpin'"
+    n_tools = len(REGISTRY.anthropic_tools)
+    n_dropped = len(REGISTRY.dropped)
 
-    await update.message.reply_text(
-        f"Yo, Helmsman's {headline}.\n"
-        f"Tools: {len(REGISTRY.anthropic_tools)} loaded, "
-        f"{len(REGISTRY.dropped)} dropped.\n"
-        f"MCP: {mcp_line}\n"
-        f"Uptime: {uptime_str}"
-    )
+    def cap(n: str) -> str:
+        return n[:1].upper() + n[1:]
+
+    good = [cap(k) for k, v in statuses.items() if v == "ok"]
+    bad = {cap(k): v.removeprefix("error: ") for k, v in statuses.items() if v != "ok"}
+
+    if not bad:
+        who = " and ".join(good) if good else "no MCPs"
+        msg = (
+            f"Yo, Helmsman's still standin' — up {uptime_str}.\n"
+            f"{n_tools} tools wired ({n_dropped} dropped on the read-only filter), "
+            f"{who} answerin' clean."
+        )
+    else:
+        bad_phrase = ", ".join(f"{n} choked ({e})" for n, e in bad.items())
+        if good:
+            tail = f"{' and '.join(good)} clean, but {bad_phrase}."
+        else:
+            tail = f"{bad_phrase}."
+        msg = (
+            f"Helmsman's limpin'. Up {uptime_str}.\n"
+            f"{n_tools} tools wired ({n_dropped} dropped). {tail}"
+        )
+
+    await update.message.reply_text(msg)
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
