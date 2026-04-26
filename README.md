@@ -23,15 +23,13 @@ Watches the bridge while you sleep, investigates alerts, and answers questions a
 
 ## How it works
 
-```mermaid
-flowchart LR
-    You([📱 You]) <-->|Telegram poll| Bridge[bridge.py]
-    Bridge <-->|Messages API| Claude[(Claude Haiku 4.5)]
-    Bridge <-->|stdio| BMCP[beszel-mcp]
-    Bridge <-->|stdio| CMCP[coolify-mcp]
-    BMCP <-->|HTTP| Beszel[(Beszel)]
-    CMCP <-->|HTTP| Coolify[(Coolify)]
-    Beszel -.alerts.-> Bridge
+```
+  Telegram  ◄─ polling ─►   bridge.py   ◄─ Messages API ─►  Claude Haiku 4.5
+   (you)                        │
+                                ├─ stdio ─►  beszel-mcp   ─ HTTP ─►  Beszel
+                                ├─ stdio ─►  coolify-mcp  ─ HTTP ─►  Coolify
+                                │
+                                └─◄─ POST /webhook/beszel ─── Beszel alerts
 ```
 
 One Python process, one async event loop. Two MCP servers run as long-lived stdio subprocesses. Telegram polling and the FastAPI webhook server share the loop via `asyncio.TaskGroup`.
