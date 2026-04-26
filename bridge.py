@@ -8,8 +8,10 @@ Claude — see FORBIDDEN_TOKENS.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -92,6 +94,26 @@ FORBIDDEN_TOKENS = (
     "set_env",
     "write",
 )
+
+# ----------------------------------------------------------------------------
+# Background log-scan config (Coolify only for v1)
+# ----------------------------------------------------------------------------
+
+LOG_SCAN_ENABLED = os.environ.get("LOG_SCAN_ENABLED", "true").lower() in ("1", "true", "yes")
+LOG_SCAN_INTERVAL_SEC = int(os.environ.get("LOG_SCAN_INTERVAL_SEC", "600"))
+LOG_SCAN_LINES = int(os.environ.get("LOG_SCAN_LINES", "200"))
+LOG_SCAN_COOLDOWN_SEC = int(os.environ.get("LOG_SCAN_COOLDOWN_SEC", "1800"))
+
+# Conservative — patterns that almost always indicate a real problem.
+# Bias toward false negatives (per Johan's preference).
+LOG_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    "oom":        re.compile(r"OOMKilled|out of memory|OutOfMemoryError|MemoryError", re.IGNORECASE),
+    "panic":      re.compile(r"\bpanic:|goroutine \d+ \[running\]:", re.IGNORECASE),
+    "traceback":  re.compile(r"Traceback \(most recent call last\)"),
+    "fatal":      re.compile(r"\b(?:FATAL|CRITICAL)\b"),
+    "segfault":   re.compile(r"segmentation fault|\bSIGSEGV\b|\bSIGKILL\b", re.IGNORECASE),
+    "unhandled":  re.compile(r"unhandled (?:promise )?(?:rejection|exception)", re.IGNORECASE),
+}
 
 
 def is_write_tool(name: str) -> bool:
@@ -196,6 +218,175 @@ async def _mcp_probe(timeout: float = 3.0) -> dict[str, str]:
         except Exception as exc:  # noqa: BLE001
             out[label] = f"error: {type(exc).__name__}"
     return out
+
+
+# ----------------------------------------------------------------------------
+# Background log scan
+# ----------------------------------------------------------------------------
+
+# uuid -> {"seen": set[str of recent lines], "alerts": {pattern_name: monotonic_ts}}
+_log_scan_state: dict[str, dict[str, Any]] = {}
+
+
+def _diff_new_lines(uuid: str, lines: list[str], cap: int = 1000) -> list[str]:
+    state = _log_scan_state.setdefault(uuid, {"seen": set(), "alerts": {}})
+    seen: set[str] = state["seen"]
+    fresh = [l for l in lines if l and l not in seen]
+    seen.update(fresh)
+    if len(seen) > cap:
+        # Keep only the most recently observed half — bounded memory.
+        state["seen"] = set(lines[-cap // 2 :])
+    return fresh
+
+
+async def _list_apps_for_scan() -> list[tuple[str, str]]:
+    """Returns list of (uuid, name) for Coolify apps, or [] if unavailable."""
+    session = MCP_SESSIONS.get("coolify")
+    if session is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            session.call_tool("list_applications", arguments={}), timeout=10
+        )
+    except Exception:
+        log.exception("log-scan: list_applications failed")
+        return []
+    text = _result_to_text(result)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        log.warning("log-scan: list_applications returned non-JSON")
+        return []
+    apps_iter: list[Any] = []
+    if isinstance(data, list):
+        apps_iter = data
+    elif isinstance(data, dict):
+        for key in ("data", "applications", "apps", "items"):
+            if isinstance(data.get(key), list):
+                apps_iter = data[key]
+                break
+    out: list[tuple[str, str]] = []
+    for app in apps_iter:
+        if not isinstance(app, dict):
+            continue
+        uuid = app.get("uuid") or app.get("id") or app.get("_id")
+        name = app.get("name") or app.get("fqdn") or str(uuid)
+        if uuid:
+            out.append((str(uuid), str(name)))
+    return out
+
+
+async def _fetch_app_logs(uuid: str) -> list[str]:
+    session = MCP_SESSIONS.get("coolify")
+    if session is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            session.call_tool(
+                "application_logs",
+                arguments={"uuid": uuid, "lines": LOG_SCAN_LINES},
+            ),
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("log-scan: application_logs(%s) failed: %s", uuid, exc)
+        return []
+    text = _result_to_text(result)
+    return [l for l in text.splitlines() if l.strip()]
+
+
+async def _scan_one_app(uuid: str, name: str) -> None:
+    lines = await _fetch_app_logs(uuid)
+    if not lines:
+        return
+    new_lines = _diff_new_lines(uuid, lines)
+    if not new_lines:
+        return
+    state = _log_scan_state[uuid]
+    alerts: dict[str, float] = state["alerts"]
+
+    triggered: list[tuple[str, list[str]]] = []
+    now = time.monotonic()
+    for pname, pattern in LOG_PATTERNS.items():
+        matches = [l for l in new_lines if pattern.search(l)]
+        if not matches:
+            continue
+        last = alerts.get(pname, 0.0)
+        if now - last < LOG_SCAN_COOLDOWN_SEC:
+            continue
+        triggered.append((pname, matches[:5]))
+        alerts[pname] = now
+
+    if not triggered:
+        return
+
+    pat_summary = ", ".join(f"`{p}` ({len(m)})" for p, m in triggered)
+    sample_lines: list[str] = []
+    for _, m in triggered:
+        sample_lines.extend(m)
+    sample_blob = "\n".join(_truncate(l, 400) for l in sample_lines[:8])
+
+    synthetic = (
+        f"Background log scan: `{name}` triggered {pat_summary}.\n\n"
+        f"Sample lines:\n{sample_blob}\n\n"
+        "What's goin' on?"
+    )
+
+    log.info("log-scan: alert on %s patterns=%s", name, [p for p, _ in triggered])
+
+    try:
+        reply, _ = await run_agent(
+            client=ANTHROPIC,
+            registry=REGISTRY,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": synthetic}],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("log-scan agent crashed")
+        reply = (
+            f"Caught somethin' suspicious in `{name}` logs ({pat_summary}) "
+            f"but I choked investigatin' it: {exc!s}"
+        )
+
+    for chunk in _split_for_telegram(reply):
+        try:
+            await TG_APP.bot.send_message(chat_id=ALLOWED_USER_ID, text=chunk)
+        except Exception:
+            log.exception("log-scan: failed to push to Telegram")
+
+
+async def _log_scan_loop() -> None:
+    if not LOG_SCAN_ENABLED:
+        log.info("log-scan: disabled")
+        return
+    log.info(
+        "log-scan: enabled (interval=%ds, lines=%d, cooldown=%ds, patterns=%s)",
+        LOG_SCAN_INTERVAL_SEC,
+        LOG_SCAN_LINES,
+        LOG_SCAN_COOLDOWN_SEC,
+        ",".join(LOG_PATTERNS.keys()),
+    )
+    # First pass: prime the seen-line set so we don't alert on already-aged logs.
+    try:
+        apps = await _list_apps_for_scan()
+        for uuid, _name in apps:
+            lines = await _fetch_app_logs(uuid)
+            _diff_new_lines(uuid, lines)
+        log.info("log-scan: primed %d apps; entering loop", len(apps))
+    except Exception:
+        log.exception("log-scan: priming failed; will retry next cycle")
+
+    while True:
+        await asyncio.sleep(LOG_SCAN_INTERVAL_SEC)
+        try:
+            apps = await _list_apps_for_scan()
+            for uuid, name in apps:
+                try:
+                    await _scan_one_app(uuid, name)
+                except Exception:
+                    log.exception("log-scan: error scanning %s", name)
+        except Exception:
+            log.exception("log-scan: outer loop error")
 
 
 def _result_to_text(result: Any) -> str:
@@ -577,6 +768,7 @@ async def main() -> None:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(server.serve(), name="uvicorn")
                 tg.create_task(_watcher(), name="signal-watcher")
+                tg.create_task(_log_scan_loop(), name="log-scan")
         except* KeyboardInterrupt:
             log.info("KeyboardInterrupt — shutting down")
         finally:

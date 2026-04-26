@@ -31,7 +31,8 @@ Watches the bridge while you sleep, investigates alerts, and answers questions a
    ├ telegram.ext.Application (handlers)
    ├ FastAPI on :8000  ◄── POST /webhook/beszel
    ├ AsyncAnthropic  ──────► Claude Haiku 4.5
-   └ AsyncExitStack { beszel-mcp, coolify-mcp }
+   ├ AsyncExitStack { beszel-mcp, coolify-mcp }
+   └ log scanner (every 10 min, regex-first, escalate to Claude on hit)
   ── cluster ─────────────────────────────────────────────
    Beszel (HTTP)        ·        Coolify API (HTTP)
   ────────────────────────────────────────────────────────
@@ -88,6 +89,25 @@ generic://helmsman:8000/webhook/beszel?@authorization=Bearer+<BESZEL_WEBHOOK_SEC
 ```
 
 The `+` after `Bearer` is Shoutrrr's encoded space. The `helmsman` hostname resolves because the bridge registers it as a network alias on the `coolify` network. Wrong/missing header → 401.
+
+---
+
+## Background log scan
+
+Every 10 minutes the bridge fetches recent logs for each Coolify app and runs them through a small set of conservative regex patterns:
+
+```
+oom        OOMKilled, out of memory, OutOfMemoryError, MemoryError
+panic      panic:, goroutine N [running]:
+traceback  Traceback (most recent call last)
+fatal      FATAL, CRITICAL
+segfault   segmentation fault, SIGSEGV, SIGKILL
+unhandled  unhandled (promise) rejection / exception
+```
+
+Most cycles match nothing → zero Claude calls. When a pattern matches *new* lines (the scanner dedupes against what it's already seen), it sends a focused snippet to Claude for an investigation reply, then pushes that to Telegram. Per-(app, pattern) cooldown of 30 minutes keeps repeat events from spamming.
+
+Cost: ~cents/day on a healthy cluster. Tune via env vars (`LOG_SCAN_ENABLED=false` to disable, `LOG_SCAN_INTERVAL_SEC` for polling cadence, etc. — see [`.env.example`](./.env.example)).
 
 ---
 
