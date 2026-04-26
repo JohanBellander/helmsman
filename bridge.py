@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -184,6 +185,18 @@ def _truncate(s: str, cap: int = TOOL_RESULT_CHAR_CAP) -> str:
     return s[:cap] + f"\n[truncated, original was {len(s)} chars]"
 
 
+async def _mcp_probe(timeout: float = 3.0) -> dict[str, str]:
+    """Liveness check on every live MCP session via list_tools()."""
+    out: dict[str, str] = {}
+    for label, session in MCP_SESSIONS.items():
+        try:
+            await asyncio.wait_for(session.list_tools(), timeout=timeout)
+            out[label] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            out[label] = f"error: {type(exc).__name__}"
+    return out
+
+
 def _result_to_text(result: Any) -> str:
     parts: list[str] = []
     for block in getattr(result, "content", []) or []:
@@ -311,9 +324,10 @@ async def on_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
     n_tools = len(REGISTRY.anthropic_tools)
+    n_dropped = len(REGISTRY.dropped)
     await update.message.reply_text(
-        f"Helmsman at the wheel. {n_tools} read-only tools loaded "
-        f"across Coolify and Beszel. Ask away.\n\nCommands: /reset"
+        f"Helmsman's up. {n_tools} read-only tools wired across Coolify and "
+        f"Beszel ({n_dropped} dropped). Commands: /health  /reset"
     )
 
 
@@ -322,6 +336,28 @@ async def on_reset(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat_histories.pop(update.effective_chat.id, None)
     await update.message.reply_text("History cleared.")
+
+
+async def on_health(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(update):
+        return
+    uptime_s = int(time.monotonic() - START_TIME) if START_TIME else 0
+    h, rem = divmod(uptime_s, 3600)
+    m, s = divmod(rem, 60)
+    uptime_str = f"{h}h {m}m" if h else f"{m}m {s}s"
+
+    statuses = await _mcp_probe()
+    mcp_line = " | ".join(f"{k}: {v}" for k, v in statuses.items()) or "(none)"
+    all_ok = bool(statuses) and all(v == "ok" for v in statuses.values())
+    headline = "still standin'" if all_ok else "limpin'"
+
+    await update.message.reply_text(
+        f"Yo, Helmsman's {headline}.\n"
+        f"Tools: {len(REGISTRY.anthropic_tools)} loaded, "
+        f"{len(REGISTRY.dropped)} dropped.\n"
+        f"MCP: {mcp_line}\n"
+        f"Uptime: {uptime_str}"
+    )
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -381,10 +417,13 @@ api = FastAPI(title="Helmsman")
 
 @api.get("/health")
 async def health() -> dict[str, Any]:
+    mcps = await _mcp_probe()
     return {
-        "ok": True,
+        "ok": bool(mcps) and all(v == "ok" for v in mcps.values()),
         "tools": len(REGISTRY.anthropic_tools),
         "dropped": len(REGISTRY.dropped),
+        "mcps": mcps,
+        "uptime_seconds": int(time.monotonic() - START_TIME) if START_TIME else 0,
     }
 
 
@@ -447,17 +486,23 @@ ANTHROPIC: AsyncAnthropic = None  # type: ignore[assignment]
 REGISTRY: ToolRegistry = ToolRegistry()
 TG_APP: Application = None  # type: ignore[assignment]
 SYSTEM_PROMPT: str = ""
+MCP_SESSIONS: dict[str, ClientSession] = {}
+START_TIME: float = 0.0
 
 
 async def main() -> None:
-    global ANTHROPIC, TG_APP, SYSTEM_PROMPT  # noqa: PLW0603
+    global ANTHROPIC, TG_APP, SYSTEM_PROMPT, START_TIME  # noqa: PLW0603
 
+    START_TIME = time.monotonic()
     SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
     ANTHROPIC = AsyncAnthropic(api_key=CONFIG["ANTHROPIC_API_KEY"])
 
     async with AsyncExitStack() as mcp_stack:
         beszel = await open_mcp(mcp_stack, beszel_params(), "beszel")
         coolify = await open_mcp(mcp_stack, coolify_params(), "coolify")
+
+        MCP_SESSIONS["beszel"] = beszel
+        MCP_SESSIONS["coolify"] = coolify
 
         await REGISTRY.register("beszel", beszel)
         await REGISTRY.register("coolify", coolify)
@@ -472,6 +517,7 @@ async def main() -> None:
         TG_APP = Application.builder().token(CONFIG["TELEGRAM_BOT_TOKEN"]).build()
         TG_APP.add_handler(CommandHandler("start", on_start))
         TG_APP.add_handler(CommandHandler("reset", on_reset))
+        TG_APP.add_handler(CommandHandler("health", on_health))
         TG_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         await TG_APP.initialize()
