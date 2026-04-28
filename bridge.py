@@ -95,6 +95,15 @@ FORBIDDEN_TOKENS = (
     "write",
 )
 
+# Tools we've found to be broken upstream — separate from the read-only filter.
+# Add a tool here when its underlying call reliably 4xx/5xx's against the current
+# service schema, so Claude doesn't keep retrying it and burning iterations.
+TOOL_DENYLIST: frozenset[str] = frozenset({
+    # beszel-mcp: filter/sort against the alerts_history collection 400s
+    # (system_id field/operator mismatch with current Beszel schema).
+    "list_alert_history",
+})
+
 # ----------------------------------------------------------------------------
 # Background log-scan config (Coolify only for v1)
 # ----------------------------------------------------------------------------
@@ -181,8 +190,13 @@ class ToolRegistry:
         listed = await session.list_tools()
         for tool in listed.tools:
             prefixed = f"{label}__{tool.name}"
+            reason: str | None = None
             if is_write_tool(tool.name):
-                self.dropped.append(prefixed)
+                reason = "write"
+            elif tool.name.lower() in TOOL_DENYLIST:
+                reason = "broken"
+            if reason:
+                self.dropped.append(f"{prefixed} ({reason})")
                 continue
             self.routes[prefixed] = (session, tool.name)
             self.anthropic_tools.append(
@@ -720,7 +734,7 @@ async def main() -> None:
 
         log.info("helmsman: %s", REGISTRY.summary())
         if REGISTRY.dropped:
-            log.info("dropped (write) tools: %s", ", ".join(sorted(REGISTRY.dropped)))
+            log.info("dropped tools: %s", ", ".join(sorted(REGISTRY.dropped)))
         else:
             log.info("no tools dropped — surprising; double-check FORBIDDEN_TOKENS")
 
