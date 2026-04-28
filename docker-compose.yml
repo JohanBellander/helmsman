@@ -17,7 +17,7 @@ services:
       - LOG_SCAN_INTERVAL_SEC=${LOG_SCAN_INTERVAL_SEC:-600}
       - LOG_SCAN_LINES=${LOG_SCAN_LINES:-200}
       - LOG_SCAN_COOLDOWN_SEC=${LOG_SCAN_COOLDOWN_SEC:-1800}
-      - LOG_SCAN_EXCLUDE=${LOG_SCAN_EXCLUDE:-helmsman}
+      - LOG_SCAN_EXCLUDE=${LOG_SCAN_EXCLUDE:-}
     networks:
       coolify:
         aliases:

@@ -114,11 +114,12 @@ LOG_SCAN_LINES = int(os.environ.get("LOG_SCAN_LINES", "200"))
 LOG_SCAN_COOLDOWN_SEC = int(os.environ.get("LOG_SCAN_COOLDOWN_SEC", "1800"))
 
 # Comma-separated substrings; an app is skipped if any needle appears in its
-# name (case-insensitive). Default skips "helmsman" so the scanner doesn't
-# recurse on its own logs and report on itself. Set to empty to scan every app.
+# name (case-insensitive). Empty by default — every app is scanned, including
+# Helmsman itself. Add app names here to silence noisy ones you don't want
+# triaged.
 LOG_SCAN_EXCLUDE: tuple[str, ...] = tuple(
     s.strip().lower()
-    for s in os.environ.get("LOG_SCAN_EXCLUDE", "helmsman").split(",")
+    for s in os.environ.get("LOG_SCAN_EXCLUDE", "").split(",")
     if s.strip()
 )
 
