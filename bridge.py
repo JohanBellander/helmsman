@@ -113,6 +113,15 @@ LOG_SCAN_INTERVAL_SEC = int(os.environ.get("LOG_SCAN_INTERVAL_SEC", "600"))
 LOG_SCAN_LINES = int(os.environ.get("LOG_SCAN_LINES", "200"))
 LOG_SCAN_COOLDOWN_SEC = int(os.environ.get("LOG_SCAN_COOLDOWN_SEC", "1800"))
 
+# Comma-separated substrings; an app is skipped if any needle appears in its
+# name (case-insensitive). Default skips "helmsman" so the scanner doesn't
+# recurse on its own logs and report on itself. Set to empty to scan every app.
+LOG_SCAN_EXCLUDE: tuple[str, ...] = tuple(
+    s.strip().lower()
+    for s in os.environ.get("LOG_SCAN_EXCLUDE", "helmsman").split(",")
+    if s.strip()
+)
+
 # Conservative — patterns that almost always indicate a real problem.
 # Bias toward false negatives (tunable via env if you want it noisier).
 LOG_PATTERNS: dict[str, "re.Pattern[str]"] = {
@@ -285,8 +294,12 @@ async def _list_apps_for_scan() -> list[tuple[str, str]]:
             continue
         uuid = app.get("uuid") or app.get("id") or app.get("_id")
         name = app.get("name") or app.get("fqdn") or str(uuid)
-        if uuid:
-            out.append((str(uuid), str(name)))
+        if not uuid:
+            continue
+        n = str(name).lower()
+        if LOG_SCAN_EXCLUDE and any(needle in n for needle in LOG_SCAN_EXCLUDE):
+            continue
+        out.append((str(uuid), str(name)))
     return out
 
 
@@ -374,10 +387,11 @@ async def _log_scan_loop() -> None:
         log.info("log-scan: disabled")
         return
     log.info(
-        "log-scan: enabled (interval=%ds, lines=%d, cooldown=%ds, patterns=%s)",
+        "log-scan: enabled (interval=%ds, lines=%d, cooldown=%ds, exclude=%s, patterns=%s)",
         LOG_SCAN_INTERVAL_SEC,
         LOG_SCAN_LINES,
         LOG_SCAN_COOLDOWN_SEC,
+        ",".join(LOG_SCAN_EXCLUDE) or "(none)",
         ",".join(LOG_PATTERNS.keys()),
     )
     # First pass: prime the seen-line set so we don't alert on already-aged logs.
