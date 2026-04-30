@@ -1,8 +1,9 @@
-"""Helmsman — Telegram + Beszel-webhook bridge to Coolify/Beszel via Claude Haiku 4.5.
+"""Helmsman — Telegram + Beszel-webhook bridge to Coolify/Beszel.
 
-One process, one event loop. Two MCP servers as long-lived stdio subprocesses.
-Read-only enforcement is done by filtering the tool list before it ever reaches
-Claude — see FORBIDDEN_TOKENS.
+Inference backend is configurable: Anthropic (Claude Haiku 4.5) or local Ollama,
+with optional automatic fallback. One process, one event loop. Two MCP servers
+as long-lived stdio subprocesses. Read-only enforcement is done by filtering
+the tool list before it ever reaches the model — see FORBIDDEN_TOKENS.
 """
 
 from __future__ import annotations
@@ -15,10 +16,16 @@ import re
 import signal
 import sys
 import time
+import uuid as uuid_lib
+from collections import deque
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anthropic as _anthropic_pkg
+import httpx
+import ollama
 import uvicorn
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
@@ -41,6 +48,9 @@ from telegram.ext import (
 
 load_dotenv()
 
+# Backend-independent core. ANTHROPIC_API_KEY is required even when Ollama is
+# the primary, because Anthropic is the default fallback. Set BACKEND_FALLBACK=
+# (empty) to disable fallback if you really want pure-local with no safety net.
 REQUIRED_ENV = [
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER_ID",
@@ -53,22 +63,66 @@ REQUIRED_ENV = [
     "BESZEL_WEBHOOK_SECRET",
 ]
 
+# Backend selection. When primary is anthropic the default fallback is empty
+# (no useful safety net since the fallback would be the same backend); when
+# primary is ollama, default fallback is anthropic.
+BACKEND_NAME = os.environ.get("BACKEND", "anthropic").lower().strip()
+_DEFAULT_FALLBACK = "anthropic" if BACKEND_NAME == "ollama" else ""
+BACKEND_FALLBACK_NAME = os.environ.get("BACKEND_FALLBACK", _DEFAULT_FALLBACK).lower().strip()
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "").strip()
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "").strip()
+OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "60"))
+
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
 
 def _load_config() -> dict[str, str]:
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
         sys.stderr.write(f"FATAL: missing env vars: {', '.join(missing)}\n")
         sys.exit(2)
+
+    valid = {"anthropic", "ollama"}
+    if BACKEND_NAME not in valid:
+        sys.stderr.write(
+            f"FATAL: BACKEND must be one of {sorted(valid)}, got {BACKEND_NAME!r}\n"
+        )
+        sys.exit(2)
+    if BACKEND_FALLBACK_NAME and BACKEND_FALLBACK_NAME not in valid:
+        sys.stderr.write(
+            f"FATAL: BACKEND_FALLBACK must be empty or one of {sorted(valid)}, "
+            f"got {BACKEND_FALLBACK_NAME!r}\n"
+        )
+        sys.exit(2)
+    if BACKEND_NAME == BACKEND_FALLBACK_NAME and BACKEND_FALLBACK_NAME:
+        sys.stderr.write(
+            "FATAL: BACKEND_FALLBACK must be different from BACKEND (or empty)\n"
+        )
+        sys.exit(2)
+
+    needs_ollama = "ollama" in (BACKEND_NAME, BACKEND_FALLBACK_NAME)
+    if needs_ollama:
+        ollama_missing: list[str] = []
+        if not OLLAMA_BASE_URL:
+            ollama_missing.append("OLLAMA_BASE_URL")
+        if not OLLAMA_MODEL:
+            ollama_missing.append("OLLAMA_MODEL")
+        if ollama_missing:
+            sys.stderr.write(
+                f"FATAL: BACKEND or BACKEND_FALLBACK is 'ollama', but missing: "
+                f"{', '.join(ollama_missing)}\n"
+            )
+            sys.exit(2)
+
     return {k: os.environ[k] for k in REQUIRED_ENV}
 
 
 CONFIG = _load_config()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ALLOWED_USER_ID = int(CONFIG["TELEGRAM_ALLOWED_USER_ID"])
-MODEL = "claude-haiku-4-5-20251001"
 MAX_TOOL_ITERS = 10
 TOOL_RESULT_CHAR_CAP = 8000
-HISTORY_TURN_CAP = 10  # 10 user + 10 assistant messages
+HISTORY_TURN_CAP = 10  # 10 user + 10 assistant text turns
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -97,7 +151,7 @@ FORBIDDEN_TOKENS = (
 
 # Tools we've found to be broken upstream — separate from the read-only filter.
 # Add a tool here when its underlying call reliably 4xx/5xx's against the current
-# service schema, so Claude doesn't keep retrying it and burning iterations.
+# service schema, so the model doesn't keep retrying it and burning iterations.
 TOOL_DENYLIST: frozenset[str] = frozenset({
     # beszel-mcp: filter/sort against the alerts_history collection 400s
     # (system_id field/operator mismatch with current Beszel schema).
@@ -188,12 +242,13 @@ async def open_mcp(stack: AsyncExitStack, params: StdioServerParameters, label: 
 class ToolRegistry:
     """Maps prefixed tool name -> (mcp session, original tool name).
 
-    Also produces the Anthropic-shaped tool schema list passed to messages.create().
+    Stores a unified tool list ({name, description, input_schema}) — each backend
+    translates to its own native shape via Backend.format_tools().
     """
 
     def __init__(self) -> None:
         self.routes: dict[str, tuple[ClientSession, str]] = {}
-        self.anthropic_tools: list[dict[str, Any]] = []
+        self.tools: list[dict[str, Any]] = []
         self.dropped: list[str] = []
 
     async def register(self, label: str, session: ClientSession) -> None:
@@ -209,7 +264,7 @@ class ToolRegistry:
                 self.dropped.append(f"{prefixed} ({reason})")
                 continue
             self.routes[prefixed] = (session, tool.name)
-            self.anthropic_tools.append(
+            self.tools.append(
                 {
                     "name": prefixed,
                     "description": tool.description or "",
@@ -218,11 +273,276 @@ class ToolRegistry:
             )
 
     def summary(self) -> str:
-        return f"{len(self.anthropic_tools)} tools registered, {len(self.dropped)} dropped"
+        return f"{len(self.tools)} tools registered, {len(self.dropped)} dropped"
 
 
 # ----------------------------------------------------------------------------
-# Agent loop
+# Backends (Anthropic / Ollama)
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """Backend-agnostic tool call. id is used to correlate with ToolResult."""
+    id: str
+    name: str  # prefixed: "beszel__list_systems"
+    input: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """Result of executing a single tool call."""
+    id: str
+    name: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass
+class InferenceResult:
+    """Outcome of a single backend.infer() call."""
+    text: str
+    tool_calls: list[ToolCall]
+    stop_reason: str  # "end_turn" | "tool_use" | "max_tokens" | other
+    backend_used: str
+    raw_assistant_message: Any  # opaque; passed to format_followup() next iteration
+
+
+class Backend:
+    """Abstract base. Subclasses translate the unified tool list and turn-scoped
+    messages list to/from their native API shape."""
+
+    name: str = "abstract"
+    timeout_sec: float | None = None  # per-inference timeout, None = no wrap
+
+    def format_tools(self, unified: list[dict[str, Any]]) -> list[Any]:
+        raise NotImplementedError
+
+    def build_initial_messages(
+        self, history: list[dict[str, str]], new_user_text: str | None
+    ) -> list[Any]:
+        """Translate canonical text-only history (+ new user text) into backend
+        message-list shape. Both Anthropic and Ollama happen to accept simple
+        {role, content} dicts for plain text turns, so the default works."""
+        msgs: list[Any] = [{"role": h["role"], "content": h["content"]} for h in history]
+        if new_user_text is not None:
+            msgs.append({"role": "user", "content": new_user_text})
+        return msgs
+
+    async def infer(
+        self, *, system: str, messages: list[Any], tools: list[Any]
+    ) -> InferenceResult:
+        raise NotImplementedError
+
+    def format_followup(
+        self, prior: InferenceResult, results: list[ToolResult]
+    ) -> list[Any]:
+        """Build the messages to append for the next iteration: assistant
+        tool_use turn + tool result(s)."""
+        raise NotImplementedError
+
+    def label(self) -> str:
+        return self.name
+
+
+class AnthropicBackend(Backend):
+    name = "anthropic"
+
+    def __init__(self, api_key: str, model: str = ANTHROPIC_MODEL):
+        self.client = AsyncAnthropic(api_key=api_key)
+        self.model = model
+
+    def format_tools(self, unified: list[dict[str, Any]]) -> list[Any]:
+        return list(unified)  # already Anthropic-shaped
+
+    async def infer(
+        self, *, system: str, messages: list[Any], tools: list[Any]
+    ) -> InferenceResult:
+        resp = await self.client.messages.create(
+            model=self.model,
+            max_tokens=2048,
+            system=system,
+            tools=tools,
+            messages=messages,
+        )
+        text = "\n".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+        tool_calls = [
+            ToolCall(id=b.id, name=b.name, input=b.input or {})
+            for b in resp.content
+            if getattr(b, "type", None) == "tool_use"
+        ]
+        return InferenceResult(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=resp.stop_reason or "end_turn",
+            backend_used=self.name,
+            raw_assistant_message={"role": "assistant", "content": resp.content},
+        )
+
+    def format_followup(
+        self, prior: InferenceResult, results: list[ToolResult]
+    ) -> list[Any]:
+        return [
+            prior.raw_assistant_message,
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tr.id,
+                        "content": tr.content,
+                        "is_error": tr.is_error,
+                    }
+                    for tr in results
+                ],
+            },
+        ]
+
+    def label(self) -> str:
+        return f"anthropic ({self.model})"
+
+
+class OllamaBackend(Backend):
+    name = "ollama"
+
+    def __init__(self, base_url: str, model: str, timeout_sec: float):
+        # Use the SDK's AsyncClient. We pass a long-ish HTTP timeout so single
+        # inferences don't fail prematurely; the asyncio.wait_for in run_agent
+        # bounds the call from outside.
+        self.client = ollama.AsyncClient(host=base_url, timeout=timeout_sec + 10)
+        self.model = model
+        self.base_url = base_url
+        self.timeout_sec = timeout_sec
+
+    def format_tools(self, unified: list[dict[str, Any]]) -> list[Any]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            }
+            for t in unified
+        ]
+
+    async def infer(
+        self, *, system: str, messages: list[Any], tools: list[Any]
+    ) -> InferenceResult:
+        # Ollama wants the system prompt as the first message with role "system".
+        # The persistent messages list does NOT contain a system entry; we
+        # prepend on every call so re-running across iterations is consistent.
+        ollama_messages = [{"role": "system", "content": system}] + messages
+        resp = await self.client.chat(
+            model=self.model,
+            messages=ollama_messages,
+            tools=tools,
+        )
+        msg = resp.message
+        tool_calls: list[ToolCall] = []
+        for tc in (msg.tool_calls or []):
+            # Ollama doesn't always provide a stable id; synthesize one.
+            tc_id = f"call_{uuid_lib.uuid4().hex[:10]}"
+            args = tc.function.arguments or {}
+            # `arguments` is already a dict in ollama-python, but fall through if
+            # a future version returns a JSON string.
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            tool_calls.append(
+                ToolCall(id=tc_id, name=tc.function.name, input=dict(args))
+            )
+        text = (msg.content or "").strip()
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        # Build a serializable assistant message for the next iteration.
+        try:
+            raw = msg.model_dump()
+        except AttributeError:
+            raw = {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in (msg.tool_calls or [])
+                ],
+            }
+        # Stuff the synthetic ids into the raw message so format_followup can
+        # pair tool results back. Ollama doesn't use the id but having it makes
+        # debug traces clearer.
+        if isinstance(raw, dict):
+            raw_calls = raw.get("tool_calls") or []
+            for i, tc_dict in enumerate(raw_calls):
+                if i < len(tool_calls) and isinstance(tc_dict, dict):
+                    tc_dict.setdefault("id", tool_calls[i].id)
+        return InferenceResult(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            backend_used=self.name,
+            raw_assistant_message=raw,
+        )
+
+    def format_followup(
+        self, prior: InferenceResult, results: list[ToolResult]
+    ) -> list[Any]:
+        out: list[Any] = [prior.raw_assistant_message]
+        for tr in results:
+            out.append(
+                {
+                    "role": "tool",
+                    "content": tr.content,
+                    "tool_name": tr.name,
+                }
+            )
+        return out
+
+    def label(self) -> str:
+        return f"ollama ({self.model})"
+
+
+# Exceptions that trip the fallback path. Narrow on purpose: only transport /
+# timeout / outage symptoms, never quality or schema problems.
+FALLBACK_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    ollama.ResponseError,
+    _anthropic_pkg.APIConnectionError,
+    _anthropic_pkg.APITimeoutError,
+)
+
+
+@dataclass
+class BackendStats:
+    last_used: str = ""
+    fallback_events: deque[float] = field(default_factory=lambda: deque(maxlen=200))
+
+    def fallback_count_24h(self) -> int:
+        cutoff = time.monotonic() - 86400
+        return sum(1 for ts in self.fallback_events if ts >= cutoff)
+
+
+def _build_backend(name: str) -> Backend:
+    if name == "anthropic":
+        return AnthropicBackend(api_key=CONFIG["ANTHROPIC_API_KEY"])
+    if name == "ollama":
+        return OllamaBackend(
+            base_url=OLLAMA_BASE_URL,
+            model=OLLAMA_MODEL,
+            timeout_sec=OLLAMA_TIMEOUT_SEC,
+        )
+    raise ValueError(f"unknown backend: {name}")
+
+
+# ----------------------------------------------------------------------------
+# Helpers
 # ----------------------------------------------------------------------------
 
 
@@ -230,6 +550,21 @@ def _truncate(s: str, cap: int = TOOL_RESULT_CHAR_CAP) -> str:
     if len(s) <= cap:
         return s
     return s[:cap] + f"\n[truncated, original was {len(s)} chars]"
+
+
+def _result_to_text(result: Any) -> str:
+    parts: list[str] = []
+    for block in getattr(result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(text)
+        else:
+            # Non-text content block (image / resource ref) — stringify so the
+            # model sees it.
+            parts.append(str(block))
+    if not parts and getattr(result, "structuredContent", None) is not None:
+        parts.append(str(result.structuredContent))
+    return "\n".join(parts) if parts else "(empty result)"
 
 
 async def _mcp_probe(timeout: float = 3.0) -> dict[str, str]:
@@ -242,6 +577,28 @@ async def _mcp_probe(timeout: float = 3.0) -> dict[str, str]:
         except Exception as exc:  # noqa: BLE001
             out[label] = f"error: {type(exc).__name__}"
     return out
+
+
+async def _dispatch_tool(tc: ToolCall) -> ToolResult:
+    """Route a tool call to the right MCP session. Errors come back as
+    ToolResult(is_error=True) so the model can recover gracefully."""
+    route = REGISTRY.routes.get(tc.name)
+    if route is None:
+        msg = f"Unknown tool: {tc.name}"
+        log.warning(msg)
+        return ToolResult(id=tc.id, name=tc.name, content=msg, is_error=True)
+    session, original = route
+    try:
+        log.info("call %s args=%s", tc.name, tc.input)
+        result = await session.call_tool(original, arguments=tc.input or {})
+        text = _truncate(_result_to_text(result))
+        is_err = bool(getattr(result, "isError", False))
+        return ToolResult(id=tc.id, name=tc.name, content=text, is_error=is_err)
+    except Exception as exc:  # noqa: BLE001 — feed everything back to the model
+        log.exception("tool %s failed", tc.name)
+        return ToolResult(
+            id=tc.id, name=tc.name, content=f"Tool error: {exc!s}", is_error=True
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -363,12 +720,7 @@ async def _scan_one_app(uuid: str, name: str) -> None:
     log.info("log-scan: alert on %s patterns=%s", name, [p for p, _ in triggered])
 
     try:
-        reply, _ = await run_agent(
-            client=ANTHROPIC,
-            registry=REGISTRY,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": synthetic}],
-        )
+        reply = await run_agent(history=[], new_user_text=synthetic)
     except Exception as exc:  # noqa: BLE001
         log.exception("log-scan agent crashed")
         reply = (
@@ -418,137 +770,105 @@ async def _log_scan_loop() -> None:
             log.exception("log-scan: outer loop error")
 
 
-def _result_to_text(result: Any) -> str:
-    parts: list[str] = []
-    for block in getattr(result, "content", []) or []:
-        text = getattr(block, "text", None)
-        if text:
-            parts.append(text)
-        else:
-            # Non-text content block (image / resource ref) — stringify so Claude sees it.
-            parts.append(str(block))
-    if not parts and getattr(result, "structuredContent", None) is not None:
-        parts.append(str(result.structuredContent))
-    return "\n".join(parts) if parts else "(empty result)"
+# ----------------------------------------------------------------------------
+# Agent loop (backend-agnostic, with fallback)
+# ----------------------------------------------------------------------------
 
 
-async def run_agent(
-    *,
-    client: AsyncAnthropic,
-    registry: ToolRegistry,
-    system: str,
-    messages: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Drive the tool-call loop. Returns (final_text, updated_messages)."""
+async def run_agent(*, history: list[dict[str, str]], new_user_text: str) -> str:
+    """Drive the tool-call loop for one user turn.
+
+    `history` is the canonical text-only conversation log
+    (`[{role, content}]` dicts, no tool blocks). Fresh empty list for one-shot
+    contexts (webhook, log scan).
+
+    Returns the final assistant text. Caller decides whether to persist
+    `(user_text, reply)` to history.
+
+    Backend handling: tries `PRIMARY_BACKEND`. On a transport-level failure
+    (FALLBACK_EXCEPTIONS), if `FALLBACK_BACKEND` is configured, switches to it
+    *for the rest of this run_agent call*. After the call returns, the next
+    user turn tries the primary again from fresh.
+    """
+    backend = PRIMARY_BACKEND
+    messages = backend.build_initial_messages(history, new_user_text)
+    tools = backend.format_tools(REGISTRY.tools)
+    fallback_used = False
+
     for iteration in range(MAX_TOOL_ITERS):
-        log.debug("agent iter %d, %d messages", iteration, len(messages))
-        resp = await client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=system,
-            tools=registry.anthropic_tools,
-            messages=messages,
-        )
-
-        if resp.stop_reason == "end_turn":
-            text = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-            messages.append({"role": "assistant", "content": resp.content})
-            return text.strip() or "(no reply)", messages
-
-        if resp.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": resp.content})
-            tool_results: list[dict[str, Any]] = []
-            for block in resp.content:
-                if getattr(block, "type", None) != "tool_use":
-                    continue
-                prefixed = block.name
-                route = registry.routes.get(prefixed)
-                if route is None:
-                    payload = f"Unknown tool: {prefixed}"
-                    log.warning(payload)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": payload,
-                            "is_error": True,
-                        }
-                    )
-                    continue
-                session, original = route
-                try:
-                    log.info("call %s args=%s", prefixed, block.input)
-                    result = await session.call_tool(original, arguments=block.input or {})
-                    text = _truncate(_result_to_text(result))
-                    is_err = bool(getattr(result, "isError", False))
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": text,
-                            "is_error": is_err,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 — we want everything fed back to Claude
-                    log.exception("tool %s failed", prefixed)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Tool error: {exc!s}",
-                            "is_error": True,
-                        }
-                    )
-            # tool_result blocks must come FIRST in the user content array.
-            messages.append({"role": "user", "content": tool_results})
+        log.debug("agent iter %d backend=%s", iteration, backend.name)
+        try:
+            if backend.timeout_sec:
+                result = await asyncio.wait_for(
+                    backend.infer(system=SYSTEM_PROMPT, messages=messages, tools=tools),
+                    timeout=backend.timeout_sec,
+                )
+            else:
+                result = await backend.infer(
+                    system=SYSTEM_PROMPT, messages=messages, tools=tools
+                )
+        except FALLBACK_EXCEPTIONS as exc:
+            if FALLBACK_BACKEND is None or fallback_used:
+                # No fallback or already on it — let the caller handle it.
+                raise
+            log.warning(
+                "backend %s failed (%s: %s); switching to fallback %s mid-turn",
+                backend.name,
+                type(exc).__name__,
+                exc,
+                FALLBACK_BACKEND.name,
+            )
+            BACKEND_STATS.fallback_events.append(time.monotonic())
+            backend = FALLBACK_BACKEND
+            messages = backend.build_initial_messages(history, new_user_text)
+            tools = backend.format_tools(REGISTRY.tools)
+            fallback_used = True
             continue
 
-        # Any other stop_reason (max_tokens, refusal, etc.) — bail with whatever text we got.
-        text = "\n".join(
-            b.text for b in resp.content if getattr(b, "type", None) == "text"
-        ).strip()
-        messages.append({"role": "assistant", "content": resp.content})
-        return text or f"(stopped: {resp.stop_reason})", messages
+        BACKEND_STATS.last_used = backend.name
 
-    return "stopping after 10 tool calls — try a more specific question.", messages
+        if result.stop_reason == "end_turn":
+            return result.text or "(no reply)"
+
+        if result.stop_reason == "tool_use":
+            tool_results = [await _dispatch_tool(tc) for tc in result.tool_calls]
+            messages.extend(backend.format_followup(result, tool_results))
+            continue
+
+        # max_tokens / refusal / other — return whatever text we got.
+        return result.text or f"(stopped: {result.stop_reason})"
+
+    return "stopping after 10 tool calls — try a more specific question."
 
 
 # ----------------------------------------------------------------------------
 # Telegram glue
 # ----------------------------------------------------------------------------
 
-# In-memory per-chat conversation history. Lost on restart — that's the v1 bargain.
-chat_histories: dict[int, list[dict[str, Any]]] = {}
+# Canonical per-chat history: {"role": "user"|"assistant", "content": "<text>"}.
+# Lost on restart — the v1 bargain.
+chat_histories: dict[int, list[dict[str, str]]] = {}
 
 
-def _trim_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Keep at most the last (HISTORY_TURN_CAP * 2) messages, but never break a
-    # tool_use / tool_result pair: assistant message containing tool_use must be
-    # immediately followed by the user message containing tool_result. Simplest
-    # safe rule: if the head we'd cut into is a user-with-tool_result, drop one
-    # more so we start cleanly on a user text message or assistant message.
+def _trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Keep at most HISTORY_TURN_CAP user/assistant pairs."""
     cap = HISTORY_TURN_CAP * 2
     if len(history) <= cap:
         return history
-    trimmed = history[-cap:]
-    # Make sure we don't start mid-pair:
-    if trimmed and trimmed[0]["role"] == "user":
-        first_content = trimmed[0]["content"]
-        if isinstance(first_content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_result" for b in first_content
-        ):
-            trimmed = trimmed[1:]
-    return trimmed
+    return history[-cap:]
 
 
 async def on_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
-    n_tools = len(REGISTRY.anthropic_tools)
+    n_tools = len(REGISTRY.tools)
     n_dropped = len(REGISTRY.dropped)
+    primary_label = PRIMARY_BACKEND.label()
+    fb_label = f", fallback: {FALLBACK_BACKEND.label()}" if FALLBACK_BACKEND else ""
     await update.message.reply_text(
         f"Helmsman's up. {n_tools} read-only tools wired across Coolify and "
-        f"Beszel ({n_dropped} dropped). Commands: /health  /reset"
+        f"Beszel ({n_dropped} dropped). Brain: {primary_label}{fb_label}. "
+        f"Commands: /health  /reset"
     )
 
 
@@ -568,7 +888,7 @@ async def on_health(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uptime_str = f"{h}h {m}m" if h else f"{m}m {s}s"
 
     statuses = await _mcp_probe()
-    n_tools = len(REGISTRY.anthropic_tools)
+    n_tools = len(REGISTRY.tools)
     n_dropped = len(REGISTRY.dropped)
 
     def cap(n: str) -> str:
@@ -579,7 +899,7 @@ async def on_health(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not bad:
         who = " and ".join(good) if good else "no MCPs"
-        msg = (
+        head = (
             f"Yo, Helmsman's still standin' — up {uptime_str}.\n"
             f"{n_tools} tools wired ({n_dropped} dropped on the read-only filter), "
             f"{who} answerin' clean."
@@ -590,12 +910,22 @@ async def on_health(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             tail = f"{' and '.join(good)} clean, but {bad_phrase}."
         else:
             tail = f"{bad_phrase}."
-        msg = (
+        head = (
             f"Helmsman's limpin'. Up {uptime_str}.\n"
             f"{n_tools} tools wired ({n_dropped} dropped). {tail}"
         )
 
-    await update.message.reply_text(msg)
+    last_used = BACKEND_STATS.last_used or "(none yet)"
+    fb_count = BACKEND_STATS.fallback_count_24h()
+    fb_label = (
+        FALLBACK_BACKEND.label() if FALLBACK_BACKEND else "(none)"
+    )
+    brain_line = (
+        f"Brain: primary {PRIMARY_BACKEND.label()}, fallback {fb_label}. "
+        f"Last used: {last_used}. Fallbacks in last 24h: {fb_count}."
+    )
+
+    await update.message.reply_text(f"{head}\n{brain_line}")
 
 
 async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,24 +934,18 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     text = update.message.text or ""
     history = chat_histories.setdefault(chat_id, [])
-    history.append({"role": "user", "content": text})
 
     try:
-        reply, history = await run_agent(
-            client=ANTHROPIC,
-            registry=REGISTRY,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
+        reply = await run_agent(history=history, new_user_text=text)
     except Exception as exc:  # noqa: BLE001
         log.exception("agent crashed")
         await update.message.reply_text(f"Bridge error: {exc!s}")
-        # Roll back the unanswered user message so /reset isn't required.
-        history.pop()
         return
 
+    # Persist canonical text turns only — no tool_use/tool_result clutter.
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = _trim_history(history)
-    # Telegram caps a single message at 4096 chars. Send chunks if needed.
     for chunk in _split_for_telegram(reply):
         await update.message.reply_text(chunk)
 
@@ -659,10 +983,16 @@ async def health() -> JSONResponse:
     ok = bool(mcps) and all(v == "ok" for v in mcps.values())
     body = {
         "ok": ok,
-        "tools": len(REGISTRY.anthropic_tools),
+        "tools": len(REGISTRY.tools),
         "dropped": len(REGISTRY.dropped),
         "mcps": mcps,
         "uptime_seconds": int(time.monotonic() - START_TIME) if START_TIME else 0,
+        "backend": {
+            "primary": PRIMARY_BACKEND.label(),
+            "fallback": FALLBACK_BACKEND.label() if FALLBACK_BACKEND else None,
+            "last_used": BACKEND_STATS.last_used or None,
+            "fallback_count_24h": BACKEND_STATS.fallback_count_24h(),
+        },
     }
     return JSONResponse(content=body, status_code=200 if ok else 503)
 
@@ -694,12 +1024,7 @@ async def beszel_webhook(
     synthetic_user += f"Message: {message}\n\nWhat's goin' on?"
 
     try:
-        reply, _ = await run_agent(
-            client=ANTHROPIC,
-            registry=REGISTRY,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": synthetic_user}],
-        )
+        reply = await run_agent(history=[], new_user_text=synthetic_user)
     except Exception as exc:  # noqa: BLE001
         log.exception("webhook agent crashed")
         reply = (
@@ -707,8 +1032,7 @@ async def beszel_webhook(
             f"Error: {exc!s}"
         )
 
-    # Push to Telegram. We send to the allowed user's chat — for a single private
-    # chat with the bot, chat_id == user_id.
+    # Push to Telegram. Single private chat with the bot means chat_id == user_id.
     for chunk in _split_for_telegram(reply):
         try:
             await TG_APP.bot.send_message(chat_id=ALLOWED_USER_ID, text=chunk)
@@ -721,8 +1045,10 @@ async def beszel_webhook(
 # Lifecycle
 # ----------------------------------------------------------------------------
 
-# These are populated in main() before either the polling or webhook starts.
-ANTHROPIC: AsyncAnthropic = None  # type: ignore[assignment]
+# Populated in main() before either polling or webhook starts.
+PRIMARY_BACKEND: Backend = None  # type: ignore[assignment]
+FALLBACK_BACKEND: Backend | None = None
+BACKEND_STATS: BackendStats = BackendStats()
 REGISTRY: ToolRegistry = ToolRegistry()
 TG_APP: Application = None  # type: ignore[assignment]
 SYSTEM_PROMPT: str = ""
@@ -731,11 +1057,20 @@ START_TIME: float = 0.0
 
 
 async def main() -> None:
-    global ANTHROPIC, TG_APP, SYSTEM_PROMPT, START_TIME  # noqa: PLW0603
+    global PRIMARY_BACKEND, FALLBACK_BACKEND, TG_APP, SYSTEM_PROMPT, START_TIME  # noqa: PLW0603
 
     START_TIME = time.monotonic()
     SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
-    ANTHROPIC = AsyncAnthropic(api_key=CONFIG["ANTHROPIC_API_KEY"])
+
+    PRIMARY_BACKEND = _build_backend(BACKEND_NAME)
+    FALLBACK_BACKEND = (
+        _build_backend(BACKEND_FALLBACK_NAME) if BACKEND_FALLBACK_NAME else None
+    )
+    log.info(
+        "backend: primary=%s, fallback=%s",
+        PRIMARY_BACKEND.label(),
+        FALLBACK_BACKEND.label() if FALLBACK_BACKEND else "(none)",
+    )
 
     async with AsyncExitStack() as mcp_stack:
         beszel = await open_mcp(mcp_stack, beszel_params(), "beszel")
@@ -785,7 +1120,7 @@ async def main() -> None:
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except (NotImplementedError, RuntimeError):
-                # Windows / non-main-thread — fall back to KeyboardInterrupt propagation.
+                # Windows / non-main-thread — fall back to KeyboardInterrupt.
                 pass
 
         async def _watcher() -> None:
