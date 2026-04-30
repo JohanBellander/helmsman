@@ -23,6 +23,7 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-}
       - OLLAMA_TIMEOUT_SEC=${OLLAMA_TIMEOUT_SEC:-60}
+      - OLLAMA_TEMPERATURE=${OLLAMA_TEMPERATURE:-0.5}
     networks:
       coolify:
         aliases:
