@@ -65,10 +65,13 @@ REQUIRED_ENV = [
 
 # Backend selection. When primary is anthropic the default fallback is empty
 # (no useful safety net since the fallback would be the same backend); when
-# primary is ollama, default fallback is anthropic.
+# primary is ollama, default fallback is anthropic. Users (or compose) setting
+# BACKEND_FALLBACK to the same value as BACKEND is silently treated as "no
+# fallback" — same backend has nothing to fall back to.
 BACKEND_NAME = os.environ.get("BACKEND", "anthropic").lower().strip()
 _DEFAULT_FALLBACK = "anthropic" if BACKEND_NAME == "ollama" else ""
-BACKEND_FALLBACK_NAME = os.environ.get("BACKEND_FALLBACK", _DEFAULT_FALLBACK).lower().strip()
+_raw_fallback = os.environ.get("BACKEND_FALLBACK", _DEFAULT_FALLBACK).lower().strip()
+BACKEND_FALLBACK_NAME = "" if _raw_fallback == BACKEND_NAME else _raw_fallback
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "").strip()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "").strip()
 OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "60"))
@@ -92,11 +95,6 @@ def _load_config() -> dict[str, str]:
         sys.stderr.write(
             f"FATAL: BACKEND_FALLBACK must be empty or one of {sorted(valid)}, "
             f"got {BACKEND_FALLBACK_NAME!r}\n"
-        )
-        sys.exit(2)
-    if BACKEND_NAME == BACKEND_FALLBACK_NAME and BACKEND_FALLBACK_NAME:
-        sys.stderr.write(
-            "FATAL: BACKEND_FALLBACK must be different from BACKEND (or empty)\n"
         )
         sys.exit(2)
 
