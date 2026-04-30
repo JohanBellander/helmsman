@@ -75,6 +75,10 @@ BACKEND_FALLBACK_NAME = "" if _raw_fallback == BACKEND_NAME else _raw_fallback
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "").strip()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "").strip()
 OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "60"))
+# Lower temperature pushes the model toward deterministic tool selection. Too
+# low (<0.3) and voice variation suffers; too high (>0.7) and tool-call
+# reliability drops on dense tool lists. 0.5 is a reasonable middle.
+OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.5"))
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
@@ -405,7 +409,7 @@ class AnthropicBackend(Backend):
 class OllamaBackend(Backend):
     name = "ollama"
 
-    def __init__(self, base_url: str, model: str, timeout_sec: float):
+    def __init__(self, base_url: str, model: str, timeout_sec: float, temperature: float = 0.5):
         # Use the SDK's AsyncClient. We pass a long-ish HTTP timeout so single
         # inferences don't fail prematurely; the asyncio.wait_for in run_agent
         # bounds the call from outside.
@@ -413,6 +417,7 @@ class OllamaBackend(Backend):
         self.model = model
         self.base_url = base_url
         self.timeout_sec = timeout_sec
+        self.temperature = temperature
 
     def format_tools(self, unified: list[dict[str, Any]]) -> list[Any]:
         return [
@@ -434,10 +439,15 @@ class OllamaBackend(Backend):
         # The persistent messages list does NOT contain a system entry; we
         # prepend on every call so re-running across iterations is consistent.
         ollama_messages = [{"role": "system", "content": system}] + messages
+        # think=True is explicit: thinking-capable models default to it, but
+        # pinning removes uncertainty across SDK / server version drift.
+        # Lower temperature reduces refusal rate on dense tool lists.
         resp = await self.client.chat(
             model=self.model,
             messages=ollama_messages,
             tools=tools,
+            think=True,
+            options={"temperature": self.temperature},
         )
         msg = resp.message
         tool_calls: list[ToolCall] = []
@@ -535,6 +545,7 @@ def _build_backend(name: str) -> Backend:
             base_url=OLLAMA_BASE_URL,
             model=OLLAMA_MODEL,
             timeout_sec=OLLAMA_TIMEOUT_SEC,
+            temperature=OLLAMA_TEMPERATURE,
         )
     raise ValueError(f"unknown backend: {name}")
 
