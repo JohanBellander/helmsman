@@ -1,9 +1,10 @@
 """Helmsman — Telegram + Beszel-webhook bridge to Coolify/Beszel.
 
-Inference backend is configurable: Anthropic (Claude Haiku 4.5) or local Ollama,
-with optional automatic fallback. One process, one event loop. Two MCP servers
-as long-lived stdio subprocesses. Read-only enforcement is done by filtering
-the tool list before it ever reaches the model — see FORBIDDEN_TOKENS.
+Inference backend is configurable: Anthropic (Claude Haiku 4.5) or a local
+llama.cpp server (OpenAI-compatible /v1 API), with optional automatic fallback.
+One process, one event loop. Two MCP servers as long-lived stdio subprocesses.
+Read-only enforcement is done by filtering the tool list before it ever
+reaches the model — see FORBIDDEN_TOKENS.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import re
 import signal
 import sys
 import time
-import uuid as uuid_lib
 from collections import deque
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -25,9 +25,10 @@ from typing import Any
 
 import anthropic as _anthropic_pkg
 import httpx
-import ollama
+import openai as _openai_pkg
 import uvicorn
 from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -48,7 +49,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-# Backend-independent core. ANTHROPIC_API_KEY is required even when Ollama is
+# Backend-independent core. ANTHROPIC_API_KEY is required even when llamacpp is
 # the primary, because Anthropic is the default fallback. Set BACKEND_FALLBACK=
 # (empty) to disable fallback if you really want pure-local with no safety net.
 REQUIRED_ENV = [
@@ -65,20 +66,21 @@ REQUIRED_ENV = [
 
 # Backend selection. When primary is anthropic the default fallback is empty
 # (no useful safety net since the fallback would be the same backend); when
-# primary is ollama, default fallback is anthropic. Users (or compose) setting
+# primary is llamacpp, default fallback is anthropic. Users (or compose) setting
 # BACKEND_FALLBACK to the same value as BACKEND is silently treated as "no
 # fallback" — same backend has nothing to fall back to.
 BACKEND_NAME = os.environ.get("BACKEND", "anthropic").lower().strip()
-_DEFAULT_FALLBACK = "anthropic" if BACKEND_NAME == "ollama" else ""
+_DEFAULT_FALLBACK = "anthropic" if BACKEND_NAME == "llamacpp" else ""
 _raw_fallback = os.environ.get("BACKEND_FALLBACK", _DEFAULT_FALLBACK).lower().strip()
 BACKEND_FALLBACK_NAME = "" if _raw_fallback == BACKEND_NAME else _raw_fallback
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "").strip()
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "").strip()
-OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "60"))
+LLAMACPP_BASE_URL = os.environ.get("LLAMACPP_BASE_URL", "").strip()
+LLAMACPP_API_KEY = os.environ.get("LLAMACPP_API_KEY", "").strip()
+LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "").strip()
+LLAMACPP_TIMEOUT_SEC = float(os.environ.get("LLAMACPP_TIMEOUT_SEC", "60"))
 # Lower temperature pushes the model toward deterministic tool selection. Too
 # low (<0.3) and voice variation suffers; too high (>0.7) and tool-call
 # reliability drops on dense tool lists. 0.5 is a reasonable middle.
-OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.5"))
+LLAMACPP_TEMPERATURE = float(os.environ.get("LLAMACPP_TEMPERATURE", "0.5"))
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
@@ -89,7 +91,7 @@ def _load_config() -> dict[str, str]:
         sys.stderr.write(f"FATAL: missing env vars: {', '.join(missing)}\n")
         sys.exit(2)
 
-    valid = {"anthropic", "ollama"}
+    valid = {"anthropic", "llamacpp"}
     if BACKEND_NAME not in valid:
         sys.stderr.write(
             f"FATAL: BACKEND must be one of {sorted(valid)}, got {BACKEND_NAME!r}\n"
@@ -102,17 +104,17 @@ def _load_config() -> dict[str, str]:
         )
         sys.exit(2)
 
-    needs_ollama = "ollama" in (BACKEND_NAME, BACKEND_FALLBACK_NAME)
-    if needs_ollama:
-        ollama_missing: list[str] = []
-        if not OLLAMA_BASE_URL:
-            ollama_missing.append("OLLAMA_BASE_URL")
-        if not OLLAMA_MODEL:
-            ollama_missing.append("OLLAMA_MODEL")
-        if ollama_missing:
+    needs_llamacpp = "llamacpp" in (BACKEND_NAME, BACKEND_FALLBACK_NAME)
+    if needs_llamacpp:
+        llamacpp_missing: list[str] = []
+        if not LLAMACPP_BASE_URL:
+            llamacpp_missing.append("LLAMACPP_BASE_URL")
+        if not LLAMACPP_MODEL:
+            llamacpp_missing.append("LLAMACPP_MODEL")
+        if llamacpp_missing:
             sys.stderr.write(
-                f"FATAL: BACKEND or BACKEND_FALLBACK is 'ollama', but missing: "
-                f"{', '.join(ollama_missing)}\n"
+                f"FATAL: BACKEND or BACKEND_FALLBACK is 'llamacpp', but missing: "
+                f"{', '.join(llamacpp_missing)}\n"
             )
             sys.exit(2)
 
@@ -279,7 +281,7 @@ class ToolRegistry:
 
 
 # ----------------------------------------------------------------------------
-# Backends (Anthropic / Ollama)
+# Backends (Anthropic / llama.cpp)
 # ----------------------------------------------------------------------------
 
 
@@ -324,8 +326,8 @@ class Backend:
         self, history: list[dict[str, str]], new_user_text: str | None
     ) -> list[Any]:
         """Translate canonical text-only history (+ new user text) into backend
-        message-list shape. Both Anthropic and Ollama happen to accept simple
-        {role, content} dicts for plain text turns, so the default works."""
+        message-list shape. Both Anthropic and OpenAI-compatible servers accept
+        simple {role, content} dicts for plain text turns, so the default works."""
         msgs: list[Any] = [{"role": h["role"], "content": h["content"]} for h in history]
         if new_user_text is not None:
             msgs.append({"role": "user", "content": new_user_text})
@@ -406,14 +408,31 @@ class AnthropicBackend(Backend):
         return f"anthropic ({self.model})"
 
 
-class OllamaBackend(Backend):
-    name = "ollama"
+class LlamaCppBackend(Backend):
+    """OpenAI-compatible /v1/chat/completions backend.
 
-    def __init__(self, base_url: str, model: str, timeout_sec: float, temperature: float = 0.5):
-        # Use the SDK's AsyncClient. We pass a long-ish HTTP timeout so single
-        # inferences don't fail prematurely; the asyncio.wait_for in run_agent
-        # bounds the call from outside.
-        self.client = ollama.AsyncClient(host=base_url, timeout=timeout_sec + 10)
+    Targets a llama.cpp server (or any other OpenAI-compatible endpoint:
+    vLLM, LM Studio, Ollama's /v1, TGI, etc.). Uses the openai Python SDK
+    so tool-call shape, message threading, and auth are handled natively.
+    """
+
+    name = "llamacpp"
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_sec: float,
+        temperature: float = 0.5,
+    ):
+        # The openai SDK requires *some* api_key string even if the server
+        # ignores it; pass a sentinel when the user hasn't configured one.
+        self.client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key or "no-key",
+            timeout=timeout_sec + 10,
+        )
         self.model = model
         self.base_url = base_url
         self.timeout_sec = timeout_sec
@@ -435,58 +454,51 @@ class OllamaBackend(Backend):
     async def infer(
         self, *, system: str, messages: list[Any], tools: list[Any]
     ) -> InferenceResult:
-        # Ollama wants the system prompt as the first message with role "system".
-        # The persistent messages list does NOT contain a system entry; we
-        # prepend on every call so re-running across iterations is consistent.
-        ollama_messages = [{"role": "system", "content": system}] + messages
-        # think=True is explicit: thinking-capable models default to it, but
-        # pinning removes uncertainty across SDK / server version drift.
-        # Lower temperature reduces refusal rate on dense tool lists.
-        resp = await self.client.chat(
+        # OpenAI-compatible servers want the system prompt as the first message
+        # with role "system". The persistent messages list does NOT contain a
+        # system entry; we prepend on every call so re-running across iterations
+        # is consistent.
+        chat_messages = [{"role": "system", "content": system}] + messages
+        resp = await self.client.chat.completions.create(
             model=self.model,
-            messages=ollama_messages,
-            tools=tools,
-            think=True,
-            options={"temperature": self.temperature},
+            messages=chat_messages,
+            tools=tools or None,
+            temperature=self.temperature,
         )
-        msg = resp.message
+        choice = resp.choices[0]
+        msg = choice.message
         tool_calls: list[ToolCall] = []
         for tc in (msg.tool_calls or []):
-            # Ollama doesn't always provide a stable id; synthesize one.
-            tc_id = f"call_{uuid_lib.uuid4().hex[:10]}"
-            args = tc.function.arguments or {}
-            # `arguments` is already a dict in ollama-python, but fall through if
-            # a future version returns a JSON string.
+            args = tc.function.arguments or "{}"
+            # OpenAI returns arguments as a JSON-encoded string; parse to dict.
             if isinstance(args, str):
                 try:
-                    args = json.loads(args)
+                    args_dict = json.loads(args) if args else {}
                 except json.JSONDecodeError:
-                    args = {}
+                    args_dict = {}
+            else:
+                args_dict = dict(args)
             tool_calls.append(
-                ToolCall(id=tc_id, name=tc.function.name, input=dict(args))
+                ToolCall(id=tc.id, name=tc.function.name, input=args_dict)
             )
         text = (msg.content or "").strip()
         stop_reason = "tool_use" if tool_calls else "end_turn"
-        # Build a serializable assistant message for the next iteration.
-        try:
-            raw = msg.model_dump()
-        except AttributeError:
-            raw = {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in (msg.tool_calls or [])
-                ],
-            }
-        # Stuff the synthetic ids into the raw message so format_followup can
-        # pair tool results back. Ollama doesn't use the id but having it makes
-        # debug traces clearer.
-        if isinstance(raw, dict):
-            raw_calls = raw.get("tool_calls") or []
-            for i, tc_dict in enumerate(raw_calls):
-                if i < len(tool_calls) and isinstance(tc_dict, dict):
-                    tc_dict.setdefault("id", tool_calls[i].id)
+        # Serializable assistant message for the next iteration. We rebuild
+        # from the parsed pieces rather than dumping the SDK object so the
+        # shape stays under our control across openai SDK versions.
+        raw: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        if tool_calls:
+            raw["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.input),
+                    },
+                }
+                for tc in tool_calls
+            ]
         return InferenceResult(
             text=text,
             tool_calls=tool_calls,
@@ -503,14 +515,14 @@ class OllamaBackend(Backend):
             out.append(
                 {
                     "role": "tool",
+                    "tool_call_id": tr.id,
                     "content": tr.content,
-                    "tool_name": tr.name,
                 }
             )
         return out
 
     def label(self) -> str:
-        return f"ollama ({self.model})"
+        return f"llamacpp ({self.model})"
 
 
 # Exceptions that trip the fallback path. Narrow on purpose: only transport /
@@ -521,9 +533,10 @@ FALLBACK_EXCEPTIONS: tuple[type[BaseException], ...] = (
     httpx.ConnectTimeout,
     httpx.ReadTimeout,
     httpx.RemoteProtocolError,
-    ollama.ResponseError,
     _anthropic_pkg.APIConnectionError,
     _anthropic_pkg.APITimeoutError,
+    _openai_pkg.APIConnectionError,
+    _openai_pkg.APITimeoutError,
 )
 
 
@@ -540,12 +553,13 @@ class BackendStats:
 def _build_backend(name: str) -> Backend:
     if name == "anthropic":
         return AnthropicBackend(api_key=CONFIG["ANTHROPIC_API_KEY"])
-    if name == "ollama":
-        return OllamaBackend(
-            base_url=OLLAMA_BASE_URL,
-            model=OLLAMA_MODEL,
-            timeout_sec=OLLAMA_TIMEOUT_SEC,
-            temperature=OLLAMA_TEMPERATURE,
+    if name == "llamacpp":
+        return LlamaCppBackend(
+            base_url=LLAMACPP_BASE_URL,
+            api_key=LLAMACPP_API_KEY,
+            model=LLAMACPP_MODEL,
+            timeout_sec=LLAMACPP_TIMEOUT_SEC,
+            temperature=LLAMACPP_TEMPERATURE,
         )
     raise ValueError(f"unknown backend: {name}")
 
