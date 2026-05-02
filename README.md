@@ -30,7 +30,7 @@ Watches the bridge while you sleep, investigates alerts, and answers questions a
    bridge.py · single asyncio event loop
    ├ telegram.ext.Application (handlers)
    ├ FastAPI on :8000  ◄── POST /webhook/beszel
-   ├ Backend (Anthropic Haiku 4.5  or  local Ollama  + optional fallback)
+   ├ Backend (Anthropic Haiku 4.5  or  local llama.cpp  + optional fallback)
    ├ AsyncExitStack { beszel-mcp, coolify-mcp }
    └ log scanner (every 10 min, regex-first, escalate to backend on hit)
   ── cluster ─────────────────────────────────────────────
@@ -113,15 +113,17 @@ Cost: ~cents/day on a healthy cluster. Tune via env vars (`LOG_SCAN_ENABLED=fals
 
 ## Switching to a local model
 
-Helmsman can run inference against a local Ollama server instead of (or with fallback from) Anthropic. Tool-capable models only — pick one of `llama3.1`, `qwen2.5`, `mistral-nemo`, or any other model Ollama lists as supporting tool calls.
+Helmsman can run inference against a local **llama.cpp** server (or any other OpenAI-compatible `/v1` endpoint — vLLM, LM Studio, Ollama's `/v1`, TGI, etc.) instead of (or with fallback from) Anthropic. Tool-capable models only — Qwen3-Coder, Qwen2.5-Coder, Llama 3.1, or any other model whose chat template supports tool calls.
 
 | Var | Default | What |
 |---|---|---|
-| `BACKEND` | `anthropic` | `anthropic` or `ollama` — the primary brain |
+| `BACKEND` | `anthropic` | `anthropic` or `llamacpp` — the primary brain |
 | `BACKEND_FALLBACK` | `anthropic` | The other one, used when the primary fails on transport (connection error / timeout). Set to empty to disable the safety net. |
-| `OLLAMA_BASE_URL` | — | Required when either backend is Ollama. e.g. `http://10.0.0.42:11434`. |
-| `OLLAMA_MODEL` | — | Required when either backend is Ollama. e.g. `qwen2.5:7b`. |
-| `OLLAMA_TIMEOUT_SEC` | `60` | Per-inference timeout. On exceed, fall back to Anthropic for the rest of that turn. |
+| `LLAMACPP_BASE_URL` | — | Required when either backend is llamacpp. The OpenAI-compatible endpoint, e.g. `https://llm.example.com/v1`. |
+| `LLAMACPP_API_KEY` | — | Bearer token if the server requires auth. Leave empty for no auth. |
+| `LLAMACPP_MODEL` | — | Required when either backend is llamacpp. The model name the server expects, e.g. `Qwen3-Coder-Next`. |
+| `LLAMACPP_TIMEOUT_SEC` | `60` | Per-inference timeout. On exceed, fall back to Anthropic for the rest of that turn. |
+| `LLAMACPP_TEMPERATURE` | `0.5` | Inference temperature. Lower (~0.3–0.5) makes tool selection more reliable on dense tool lists. |
 
 `ANTHROPIC_API_KEY` is required regardless — it serves as the default fallback. Set `BACKEND_FALLBACK=` (empty) if you really want pure-local with no safety net.
 
