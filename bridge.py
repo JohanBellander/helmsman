@@ -132,6 +132,8 @@ logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Silence httpx's per-request INFO line — emitted on every Telegram long-poll.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("helmsman")
 
 # ----------------------------------------------------------------------------
