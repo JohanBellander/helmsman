@@ -227,7 +227,7 @@ def _needs_beszel_filter_hint(label: str, schema: dict[str, Any] | None) -> bool
 # MCP servers
 # ----------------------------------------------------------------------------
 
-# Inherit PATH so `npx` and `beszel-mcp` resolve. Pass through anything Coolify
+# Inherit PATH so `beszel-mcp` resolves. Pass through anything Coolify
 # might inject (HTTP_PROXY etc.) — minimal baseline:
 def _base_env() -> dict[str, str]:
     keep = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
@@ -248,9 +248,11 @@ def coolify_params() -> StdioServerParameters:
         "COOLIFY_BASE_URL": CONFIG["COOLIFY_BASE_URL"],
         "COOLIFY_ACCESS_TOKEN": CONFIG["COOLIFY_ACCESS_TOKEN"],
     }
+    # Direct `node` invocation against the locally-installed package — avoids
+    # depending on npx (which is part of npm, dropped from the runtime image).
     return StdioServerParameters(
-        command="npx",
-        args=["@masonator/coolify-mcp@latest"],
+        command="node",
+        args=["/app/node_modules/@masonator/coolify-mcp/dist/index.js"],
         env=env,
     )
 
