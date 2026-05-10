@@ -200,6 +200,29 @@ def is_write_tool(name: str) -> bool:
     return any(tok in n for tok in FORBIDDEN_TOKENS)
 
 
+# beszel-mcp's tool docstrings show filter examples wrapped in Python string
+# delimiters (e.g. `"name ~ 'server'"`); the model tends to copy those outer
+# quotes into the filter argument verbatim, which PocketBase rejects as a
+# malformed expression. Append explicit guidance for any beszel tool whose
+# schema declares a `filter` parameter.
+_BESZEL_FILTER_HINT = (
+    "\n\n"
+    "Filter syntax: pass exactly the predicate, e.g. name='Steve'. "
+    "Do NOT wrap the whole expression in outer quotes — \"name='Steve'\" is wrong. "
+    "String comparisons with = are case-sensitive; for case-insensitive "
+    "substring matching use ~ (e.g. name~'steve')."
+)
+
+
+def _needs_beszel_filter_hint(label: str, schema: dict[str, Any] | None) -> bool:
+    if label != "beszel":
+        return False
+    if not isinstance(schema, dict):
+        return False
+    props = schema.get("properties")
+    return isinstance(props, dict) and "filter" in props
+
+
 # ----------------------------------------------------------------------------
 # MCP servers
 # ----------------------------------------------------------------------------
@@ -269,12 +292,16 @@ class ToolRegistry:
             if reason:
                 self.dropped.append(f"{prefixed} ({reason})")
                 continue
+            description = tool.description or ""
+            schema = tool.inputSchema or {"type": "object", "properties": {}}
+            if _needs_beszel_filter_hint(label, schema):
+                description = description + _BESZEL_FILTER_HINT
             self.routes[prefixed] = (session, tool.name)
             self.tools.append(
                 {
                     "name": prefixed,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema or {"type": "object", "properties": {}},
+                    "description": description,
+                    "input_schema": schema,
                 }
             )
 
@@ -604,6 +631,31 @@ async def _mcp_probe(timeout: float = 3.0) -> dict[str, str]:
     return out
 
 
+def _sanitize_beszel_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Strip stray outer double-quotes around beszel ``filter`` arguments.
+
+    beszel-mcp's tool docstrings show filter examples wrapped in Python
+    string delimiters (e.g. ``"name ~ 'x'"``); the model often copies those
+    outer quotes verbatim, which PocketBase rejects with 400. Last-line
+    defense — see ``_BESZEL_FILTER_HINT`` for the registration-time fix
+    that should prevent it in the first place.
+    """
+    if not name.startswith("beszel__"):
+        return args
+    flt = args.get("filter")
+    if not (isinstance(flt, str) and len(flt) >= 3):
+        return args
+    if flt[0] != '"' or flt[-1] != '"':
+        return args
+    inner = flt[1:-1]
+    if not any(op in inner for op in ("=", "~", "<", ">")):
+        return args
+    cleaned = dict(args)
+    cleaned["filter"] = inner
+    log.warning("stripped outer quotes from %s filter: %r -> %r", name, flt, inner)
+    return cleaned
+
+
 async def _dispatch_tool(tc: ToolCall) -> ToolResult:
     """Route a tool call to the right MCP session. Errors come back as
     ToolResult(is_error=True) so the model can recover gracefully."""
@@ -614,8 +666,9 @@ async def _dispatch_tool(tc: ToolCall) -> ToolResult:
         return ToolResult(id=tc.id, name=tc.name, content=msg, is_error=True)
     session, original = route
     try:
-        log.info("call %s args=%s", tc.name, tc.input)
-        result = await session.call_tool(original, arguments=tc.input or {})
+        args = _sanitize_beszel_args(tc.name, tc.input or {})
+        log.info("call %s args=%s", tc.name, args)
+        result = await session.call_tool(original, arguments=args)
         text = _truncate(_result_to_text(result))
         is_err = bool(getattr(result, "isError", False))
         return ToolResult(id=tc.id, name=tc.name, content=text, is_error=is_err)
