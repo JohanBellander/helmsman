@@ -5,5 +5,10 @@
   "description": "npm deps for the Helmsman bridge — only @masonator/coolify-mcp",
   "dependencies": {
     "@masonator/coolify-mcp": "latest"
+  },
+  "overrides": {
+    "picomatch": "^4.0.4",
+    "brace-expansion": "^2.0.3",
+    "ip-address": "^10.1.1"
   }
 }

@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# CVE-2026-6357: upgrade pip. CVE-2025-8869 N/A on Python 3.12 (PEP 706).
+RUN pip install --no-cache-dir --upgrade "pip>=26.1"
+
 # Node 20 (for the @masonator/coolify-mcp stdio server). Use NodeSource so we get
 # a recent npm without the apt-default's old version. ca-certificates + curl needed
 # for the NodeSource setup script.
