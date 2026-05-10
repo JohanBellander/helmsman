@@ -9,6 +9,10 @@
   "overrides": {
     "picomatch": "^4.0.4",
     "brace-expansion": "^2.0.3",
-    "ip-address": "^10.1.1"
+    "ip-address": "^10.1.1",
+    "cross-spawn": "^7.0.5",
+    "glob": "^11.0.0",
+    "minimatch": "^10.0.0",
+    "tar": "^7.4.0"
   }
 }

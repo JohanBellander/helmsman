@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install the Coolify MCP locally so `npx @masonator/coolify-mcp@latest` is fast
 # at runtime (no per-spawn registry roundtrip).
 COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+RUN npm install --omit=dev --no-audit --no-fund --package-lock-only && \
+    npm install --omit=dev --no-audit --no-fund
 
 # Now the source.
 COPY bridge.py system_prompt.md ./
