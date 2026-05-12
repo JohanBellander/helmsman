@@ -32,7 +32,10 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      # curl is purged from the runtime image (see Dockerfile); use python's
+      # stdlib instead. urlopen raises on 5xx, so a degraded /health (503)
+      # correctly fails the probe.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
