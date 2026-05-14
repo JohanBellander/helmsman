@@ -134,6 +134,57 @@ logging.basicConfig(
 )
 # Silence httpx's per-request INFO line — emitted on every Telegram long-poll.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class _TelegramTransientRetryFilter(logging.Filter):
+    """Collapse python-telegram-bot's per-retry traceback ERRORs to one-line WARNINGs.
+
+    The Updater's network retry loop emits a full traceback at ERROR on every
+    failed get_updates while it's already retrying internally. For known
+    transport failures (connect/timeout/DNS), the stack is always the same
+    and the loop recovers on its own — and the repeated `Traceback (most
+    recent call last)` lines also self-trigger our log scanner. Collapse
+    those to a one-line WARNING; unknown exception types pass through with
+    their traceback intact.
+    """
+
+    _TRANSIENT_EXC_NAMES = frozenset({
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ReadError",
+        "PoolTimeout",
+        "RemoteProtocolError",
+        "NetworkError",
+        "TimedOut",
+    })
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc_info = record.exc_info
+        if not isinstance(exc_info, tuple):
+            return True
+        exc_type, exc_value, _ = exc_info
+        if exc_type is None:
+            return True
+        names = {exc_type.__name__}
+        cur = exc_value
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            names.add(type(cur).__name__)
+            cur = cur.__cause__ or cur.__context__
+        if names & self._TRANSIENT_EXC_NAMES:
+            record.msg = "telegram polling retry: %s: %s"
+            record.args = (exc_type.__name__, exc_value)
+            record.exc_info = None
+            record.exc_text = None
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
+
+logging.getLogger("telegram.ext.Updater").addFilter(_TelegramTransientRetryFilter())
+
 log = logging.getLogger("helmsman")
 
 # ----------------------------------------------------------------------------
