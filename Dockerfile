@@ -2,7 +2,12 @@
 FROM python:3.12-slim AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
+# `apt-get upgrade` here is intentional: the base layer is cached on the
+# Coolify build host and lags Debian security updates by days-to-weeks.
+# Upgrading inline guarantees every build pulls the freshest libpython3.13
+# etc. regardless of base-image age. Costs ~15MB / ~30s per build.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg git \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
@@ -34,7 +39,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # (brace-expansion, glob, minimatch, tar, etc. under
 # /usr/lib/node_modules/npm/node_modules/). bridge.py invokes the Coolify
 # MCP via `node /app/node_modules/.../dist/index.js`, so npx isn't needed.
+# See build stage above — `apt-get upgrade` is here for the same reason:
+# the runtime base is cached on the build host and needs an explicit
+# refresh to pick up Debian security updates.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
