@@ -52,6 +52,13 @@ RUN apt-get update \
  && apt-get purge -y --auto-remove curl \
  && rm -rf /var/lib/apt/lists/*
 
+# Upgrade pip in the runtime stage too. The build stage's `pip install
+# --upgrade pip` only touches build-side site-packages; pip itself isn't
+# in /install (only requirements are), so without this line the runtime
+# image keeps the base-layer pip 25.0.1 and Trivy flags it for
+# CVE-2025-8869 / CVE-2026-6357 even though we never invoke pip at runtime.
+RUN pip install --no-cache-dir --upgrade "pip>=26.1"
+
 WORKDIR /app
 
 # Python packages and their console scripts (e.g. beszel-mcp).
