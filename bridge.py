@@ -245,6 +245,30 @@ LOG_PATTERNS: dict[str, "re.Pattern[str]"] = {
     "unhandled":  re.compile(r"unhandled (?:promise )?(?:rejection|exception)", re.IGNORECASE),
 }
 
+# Comma-separated `app:pattern` pairs (case-insensitive); for each pair, the
+# scanner skips that pattern when scanning apps whose name contains `app` as a
+# substring. Lets you keep an app under scan for genuine failures while
+# silencing one keyword that legitimately appears in its normal output (e.g.
+# Deadbolt's CVE tool results echo `"severity": "CRITICAL"` JSON values that
+# would otherwise trip the `fatal` pattern).
+LOG_SCAN_EXCLUDE_PATTERNS: tuple[tuple[str, str], ...] = tuple(
+    (app, pat)
+    for entry in os.environ.get("LOG_SCAN_EXCLUDE_PATTERNS", "").split(",")
+    if ":" in entry
+    for app, pat in [tuple(s.strip().lower() for s in entry.split(":", 1))]
+    if app and pat
+)
+# Flag typo'd pattern names at startup — a silent typo means the user thinks
+# they've silenced a pattern but haven't.
+def _warn_unknown_exclude_patterns() -> None:
+    for app, pat in LOG_SCAN_EXCLUDE_PATTERNS:
+        if pat not in LOG_PATTERNS:
+            log.warning(
+                "LOG_SCAN_EXCLUDE_PATTERNS: unknown pattern %r for app %r — valid names: %s",
+                pat, app, ",".join(LOG_PATTERNS.keys()),
+            )
+_warn_unknown_exclude_patterns()
+
 
 def is_write_tool(name: str) -> bool:
     n = name.lower()
@@ -823,7 +847,13 @@ async def _scan_one_app(uuid: str, name: str) -> None:
 
     triggered: list[tuple[str, list[str]]] = []
     now = time.monotonic()
+    name_lower = str(name).lower()
     for pname, pattern in LOG_PATTERNS.items():
+        if any(
+            needle in name_lower and pname == target
+            for needle, target in LOG_SCAN_EXCLUDE_PATTERNS
+        ):
+            continue
         matches = [l for l in new_lines if pattern.search(l)]
         if not matches:
             continue
@@ -871,12 +901,13 @@ async def _log_scan_loop() -> None:
         log.info("log-scan: disabled")
         return
     log.info(
-        "log-scan: enabled (interval=%ds, lines=%d, cooldown=%ds, exclude=%s, patterns=%s)",
+        "log-scan: enabled (interval=%ds, lines=%d, cooldown=%ds, exclude=%s, patterns=%s, pattern_excludes=%s)",
         LOG_SCAN_INTERVAL_SEC,
         LOG_SCAN_LINES,
         LOG_SCAN_COOLDOWN_SEC,
         ",".join(LOG_SCAN_EXCLUDE) or "(none)",
         ",".join(LOG_PATTERNS.keys()),
+        ",".join(f"{app}:{pat}" for app, pat in LOG_SCAN_EXCLUDE_PATTERNS) or "(none)",
     )
     # First pass: prime the seen-line set so we don't alert on already-aged logs.
     try:

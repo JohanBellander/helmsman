@@ -105,7 +105,7 @@ segfault   segmentation fault, SIGSEGV, SIGKILL
 unhandled  unhandled (promise) rejection / exception
 ```
 
-Most cycles match nothing → zero Claude calls. When a pattern matches *new* lines (the scanner dedupes against what it's already seen), it sends a focused snippet to Claude for an investigation reply, then pushes that to Telegram. Per-(app, pattern) cooldown of 30 minutes keeps repeat events from spamming.
+Most cycles match nothing → zero Claude calls. When a pattern matches *new* lines (the scanner dedupes against what it's already seen), it sends a focused snippet to Claude for an investigation reply, then pushes that to Telegram. Per-(app, pattern) cooldown of 30 minutes keeps repeat events from spamming. Per-app pattern exclusion is available via `LOG_SCAN_EXCLUDE_PATTERNS` (e.g. `deadbolt:fatal`) for cases where an app's normal output legitimately contains a scanner keyword.
 
 Cost: ~cents/day on a healthy cluster. Tune via env vars (`LOG_SCAN_ENABLED=false` to disable, `LOG_SCAN_INTERVAL_SEC` for polling cadence, etc. — see [`.env.example`](./.env.example)).
 
