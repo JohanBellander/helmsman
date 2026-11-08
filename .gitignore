@@ -11,3 +11,8 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# Agent tooling (personal / per-session)
+.agent/
+.claude/settings.local.json
+.claude/worktrees/
